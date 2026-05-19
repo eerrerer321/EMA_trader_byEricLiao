@@ -1,0 +1,9 @@
+.env
+strategy_state.json
+__pycache__/
+*.py[cod]
+
+# Local backtest / optimization outputs
+rolling_*results*/
+rolling_integrated_*/
+optuna_results*/
