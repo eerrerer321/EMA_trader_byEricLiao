@@ -38,6 +38,7 @@ ALLOW_SAME_BAR_REVERSAL = False
 TRADE_SIDE_MODE = os.getenv("TRADE_SIDE_MODE", "long_only").lower()  # "long_only", "short_only", "both"
 VALID_TRADE_SIDE_MODES = {"long_only", "short_only", "both"}
 ENTRY_PRICE_SYNC_TOLERANCE_PCT = 0.0001  # 0.01%; exchange avgPrice drift above this triggers local sync
+LOCAL_FIXED_STOP_FALLBACK_BUFFER_PCT = 0.002  # 0.2%; let exchange MarkPrice SL trigger first when price is near stop
 STOP_LOSS_SYNC_RETRIES = 3
 STOP_LOSS_SYNC_RETRY_DELAY_SECONDS = 2
 KLINE_COMPLETION_BUFFER_SECONDS = 10
@@ -62,8 +63,8 @@ STRATEGY_PARAMS = {
 TRADE_SLEEP_SECONDS = 60  # 每隔多久檢查一次新K線 (60秒檢查一次)
 FETCH_KLINE_LIMIT = 300  # 獲取多少根K線用於指標計算 (確保涵蓋EMA200所需的數據量)
 
-# 定義保存狀態的檔案路徑
-STATE_FILE = "strategy_state.json"
+# 定義保存狀態的檔案路徑（用腳本所在目錄，避免 cron/systemd 等不同 cwd 啟動時寫到錯地方）
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "strategy_state.json")
 
 
 # --- 1. 數據載入 (從 Bybit API 獲取數據) ---
@@ -633,15 +634,26 @@ class TradingStrategy:
             return self._fixed_stop_price_for_side("short")
         return None
 
-    def _handle_local_fixed_stop_fallback(self, position_side, current_close, current_time):
-        """本地 1m 固定停損兜底，避免交易所端 SL 設定失敗時裸倉。"""
+    def _handle_local_fixed_stop_fallback(
+        self, position_side, current_low, current_high, current_close, current_time
+    ):
+        """本地 1m 固定停損兜底，避免交易所端 SL 設定失敗時裸倉。
+
+        用 1m K 線的 low/high 判斷，對齊回測中 `bar_low <= fixed_stop` /
+        `bar_high >= fixed_stop` 的觸發語意。保留 buffer 讓交易所端 MarkPrice
+        SL 有機會先觸發。
+        """
         fixed_stop = self._fixed_stop_price_for_side(position_side)
         if not fixed_stop:
             return False
 
+        # The exchange protective SL triggers on MarkPrice. Keep this as a true
+        # fallback by requiring price to move clearly beyond the fixed stop.
+        long_fallback_stop = fixed_stop * (1 - LOCAL_FIXED_STOP_FALLBACK_BUFFER_PCT)
+        short_fallback_stop = fixed_stop * (1 + LOCAL_FIXED_STOP_FALLBACK_BUFFER_PCT)
         triggered = (
-            (position_side == "long" and current_close <= fixed_stop)
-            or (position_side == "short" and current_close >= fixed_stop)
+            (position_side == "long" and current_low <= long_fallback_stop)
+            or (position_side == "short" and current_high >= short_fallback_stop)
         )
         if not triggered:
             return False
@@ -649,8 +661,11 @@ class TradingStrategy:
         print(f"\n\n🚨 === 本地 1m 固定停損兜底觸發 ===")
         print(f"時間: {current_time}")
         print(f"方向: {position_side.upper()}")
-        print(f"當前價格: ${current_close:.2f}")
+        trigger_extreme = current_low if position_side == "long" else current_high
+        print(f"觸發極值: ${trigger_extreme:.2f} (close ${current_close:.2f})")
         print(f"固定停損價: ${fixed_stop:.2f}")
+        fallback_stop = long_fallback_stop if position_side == "long" else short_fallback_stop
+        print(f"兜底觸發價: ${fallback_stop:.2f}")
         close_success = self._close_position(current_close)
         if close_success:
             print("✅ 本地固定停損兜底平倉完成")
@@ -668,6 +683,33 @@ class TradingStrategy:
         if not hasattr(self.exchange, "private_post_v5_position_trading_stop"):
             print("⚠️ 目前 ccxt 版本不支援 Bybit trading-stop 原始 API，無法設定交易所端停損。")
             return False
+
+        try:
+            ticker = self.exchange.fetch_ticker(self.symbol)
+            ticker_info = ticker.get("info") if isinstance(ticker.get("info"), dict) else {}
+            market_price = self._coerce_positive_float(
+                ticker.get("mark")
+                or ticker_info.get("markPrice")
+                or ticker.get("last")
+                or ticker.get("close")
+            )
+        except Exception as e:
+            market_price = None
+            print(f"⚠️ 停損合理性檢查無法取得市價，仍會嘗試設定停損: {e}")
+
+        if market_price:
+            if position_side == "long" and stop_price >= market_price:
+                print(
+                    f"⚠️ 多單停損 ${stop_price:.2f} >= 現價 ${market_price:.2f}，"
+                    "跳過交易所端停損設定，請檢查 entry_price / trail state。"
+                )
+                return False
+            if position_side == "short" and stop_price <= market_price:
+                print(
+                    f"⚠️ 空單停損 ${stop_price:.2f} <= 現價 ${market_price:.2f}，"
+                    "跳過交易所端停損設定，請檢查 entry_price / trail state。"
+                )
+                return False
 
         params = {
             "category": "linear",
@@ -725,6 +767,21 @@ class TradingStrategy:
         except (TypeError, ValueError):
             return None
 
+    def _order_execution_price(self, order, fallback_price):
+        """Best-effort execution price extraction; falls back to caller's market snapshot."""
+        if not order:
+            return fallback_price
+        for field in ("average", "price", "avgPrice", "lastPrice", "executedPrice"):
+            price = self._coerce_positive_float(order.get(field))
+            if price:
+                return price
+        info = order.get("info") if isinstance(order.get("info"), dict) else {}
+        for field in ("avgPrice", "price", "lastPrice", "executedPrice"):
+            price = self._coerce_positive_float(info.get(field))
+            if price:
+                return price
+        return fallback_price
+
     def _entry_price_changed(self, old_price, new_price):
         if not old_price or old_price <= 0:
             return True
@@ -769,6 +826,7 @@ class TradingStrategy:
             f"🔧 進場均價同步 ({position_side.upper()}): "
             f"${local_price or 0:.2f} → ${avg_price:.2f}"
         )
+        print("⚠️ 進場價已同步，移動停損狀態可能立即變更；若剛手動加倉，請確認這符合你的倉位意圖。")
         self.entry_price = avg_price
         if position_side == "long":
             self.long_entry_price = avg_price
@@ -788,8 +846,8 @@ class TradingStrategy:
         self._sync_exchange_protective_stop("進場均價同步後校正停損")
         return True
 
-    def _get_current_position_size(self):
-        """獲取 Bybit 統一帳戶目前持倉量，並同步交易所 avgPrice 到本地停損基準。"""
+    def _get_current_position_size(self, sync_entry_price=True):
+        """獲取 Bybit 統一帳戶目前持倉量，可選擇同步交易所 avgPrice 到本地停損基準。"""
         try:
             positions = self._fetch_raw_positions()
             for pos in positions:
@@ -800,15 +858,18 @@ class TradingStrategy:
                 side = pos.get("side", "")
                 avg_price = self._coerce_positive_float(pos.get("avgPrice"))
                 mark_price = pos.get("markPrice")
-                if side == "Buy" and avg_price:
+                if side == "Buy":
                     self.position_size = size
-                    self._sync_entry_price_from_exchange("long", avg_price, mark_price)
+                    if sync_entry_price and avg_price:
+                        self._sync_entry_price_from_exchange("long", avg_price, mark_price)
                     return size
-                if side == "Sell" and avg_price:
+                if side == "Sell":
                     self.position_size = -size
-                    self._sync_entry_price_from_exchange("short", avg_price, mark_price)
+                    if sync_entry_price and avg_price:
+                        self._sync_entry_price_from_exchange("short", avg_price, mark_price)
                     return -size
 
+            self.position_size = 0
             print("📊 無持倉")
             return 0
 
@@ -1081,7 +1142,7 @@ class TradingStrategy:
                 print(
                     f"🔍 確認嘗試 {confirm_attempt+1}/{confirmation_retries}: 查詢平倉後持倉..."
                 )
-                final_position = self._get_current_position_size()
+                final_position = self._get_current_position_size(sync_entry_price=False)
 
                 if final_position == 0:
                     print(f"✅ 平倉成功確認：持倉已清零")
@@ -1103,20 +1164,21 @@ class TradingStrategy:
                 )
                 return False
 
-            # 計算盈虧
+            # 計算盈虧。優先使用訂單回傳成交價，取不到才退回觸發時的市場快照。
+            exit_price = self._order_execution_price(order, current_close)
             entry_price_for_calc = (
                 self.long_entry_price if actual_position > 0 else self.short_entry_price
             )
             if entry_price_for_calc is not None and entry_price_for_calc > 0:
                 if actual_position > 0:
                     profit_loss = (
-                        current_close - entry_price_for_calc
+                        exit_price - entry_price_for_calc
                     ) * actual_position
                 else:
-                    profit_loss = (entry_price_for_calc - current_close) * abs(
+                    profit_loss = (entry_price_for_calc - exit_price) * abs(
                         actual_position
                     )
-                print(f"💰 平倉盈虧: ${profit_loss:.2f} USDT")
+                print(f"💰 平倉盈虧: ${profit_loss:.2f} USDT (估算成交價 ${exit_price:.2f})")
             else:
                 profit_loss = 0
                 print("⚠️ 無進場價格記錄，無法計算精確盈虧")
@@ -1138,7 +1200,8 @@ class TradingStrategy:
                 {
                     "time": datetime.now().isoformat(),
                     "type": "EXIT_REAL",
-                    "price": current_close,
+                    "price": exit_price,
+                    "trigger_price": current_close,
                     "profit_loss": profit_loss,
                     "current_position_size": self.position_size,
                     "current_capital": self.current_capital,
@@ -1178,8 +1241,12 @@ class TradingStrategy:
             # trade_log 不建議保存所有歷史，只保存關鍵交易狀態
         }
         try:
-            with open(STATE_FILE, "w") as f:
+            tmp_path = STATE_FILE + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(state, f, indent=4)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, STATE_FILE)
             print(f"策略狀態已保存到 {STATE_FILE}")
             return True
         except Exception as e:
@@ -1508,10 +1575,10 @@ class TradingStrategy:
                         )
                         self.long_entry_price = self.entry_price
 
-                    self.long_peak = current_high
-                    self.long_trail_stop_price = None
-                    self.is_long_trail_active = False
-                    self._sync_exchange_protective_stop("多單進場後固定停損")
+                    self.long_peak = max(self.long_peak or current_high, current_high)
+                    if not self.is_long_trail_active:
+                        self.long_trail_stop_price = None
+                    self._sync_exchange_protective_stop("多單進場後保護停損")
                     print(
                         f"多單已進場，數量: {self.position_size:.3f} @ {self.entry_price:.2f}"
                     )
@@ -1541,13 +1608,13 @@ class TradingStrategy:
                 1 - self.long_fixed_stop_loss_percent
             )
 
-            # 固定停損觸發條件 - 使用收盤價判斷
-            long_fixed_stop_loss_triggered = current_close <= long_fixed_stop_loss_price
+            # 固定停損觸發條件 - 用 4H K 線最低點判斷（對齊回測 bar_low <= fixed_stop）
+            long_fixed_stop_loss_triggered = current_low <= long_fixed_stop_loss_price
 
             # 添加詳細的固定停損檢查日誌
             print(f"\n📊 多單固定停損檢查:")
             print(f"   固定停損價格: {long_fixed_stop_loss_price:.2f}")
-            print(f"   當前收盤價: {current_close:.2f}")
+            print(f"   K線最低: {current_low:.2f} | 收盤: {current_close:.2f}")
 
             # 顯示移動停損詳細信息
             if self.is_long_trail_active:
@@ -1563,13 +1630,13 @@ class TradingStrategy:
 
             if long_fixed_stop_loss_triggered:
                 print(
-                    f"🚨 固定止損觸發: 當前收盤價${current_close:.2f} <= 固定止損價${long_fixed_stop_loss_price:.2f}"
+                    f"🚨 固定止損觸發: K線最低${current_low:.2f} <= 固定止損價${long_fixed_stop_loss_price:.2f}"
                 )
 
                 print(f"\n🚨 === 多單固定停損平倉觸發 ===")
                 print(f"時間: {current_time}")
                 print(f"觸發原因: FIXED_STOP")
-                print(f"當前價格: ${current_close:.2f}")
+                print(f"觸發極值: ${current_low:.2f} (close ${current_close:.2f})")
                 print(f"持倉量: {self.position_size}")
                 print(f"進場價: ${self.long_entry_price:.2f}")
 
@@ -1633,10 +1700,10 @@ class TradingStrategy:
                         self.short_entry_price = self.entry_price
                         print(f"⚠️ 查詢持倉失敗，使用訂單資訊: ${self.entry_price:.2f}")
 
-                    self.short_trough = current_low
-                    self.short_trail_stop_price = None
-                    self.is_short_trail_active = False
-                    self._sync_exchange_protective_stop("空單進場後固定停損")
+                    self.short_trough = min(self.short_trough or current_low, current_low)
+                    if not self.is_short_trail_active:
+                        self.short_trail_stop_price = None
+                    self._sync_exchange_protective_stop("空單進場後保護停損")
                     print(
                         f"空單已進場，數量: {abs(self.position_size):.3f} @ {self.entry_price:.2f}"
                     )
@@ -1669,15 +1736,15 @@ class TradingStrategy:
                 1 + self.short_fixed_stop_loss_percent
             )
 
-            # 固定停損觸發條件 - 使用收盤價判斷
+            # 固定停損觸發條件 - 用 4H K 線最高點判斷（對齊回測 bar_high >= fixed_stop）
             short_fixed_stop_loss_triggered = (
-                current_close >= short_fixed_stop_loss_price
+                current_high >= short_fixed_stop_loss_price
             )
 
             # 添加詳細的固定停損檢查日誌
             print(f"📊 空單固定停損檢查:")
             print(f"   固定停損價格: {short_fixed_stop_loss_price:.2f}")
-            print(f"   當前收盤價: {current_close:.2f}")
+            print(f"   K線最高: {current_high:.2f} | 收盤: {current_close:.2f}")
 
             # 顯示移動停損詳細信息
             if self.is_short_trail_active:
@@ -1693,13 +1760,13 @@ class TradingStrategy:
 
             if short_fixed_stop_loss_triggered:
                 print(
-                    f"🚨 固定止損觸發: 當前收盤價${current_close:.2f} >= 固定止損價${short_fixed_stop_loss_price:.2f}"
+                    f"🚨 固定止損觸發: K線最高${current_high:.2f} >= 固定止損價${short_fixed_stop_loss_price:.2f}"
                 )
 
                 print(f"\n🚨 === 空單固定停損平倉觸發 ===")
                 print(f"時間: {current_time}")
                 print(f"觸發原因: FIXED_STOP")
-                print(f"當前價格: ${current_close:.2f}")
+                print(f"觸發極值: ${current_high:.2f} (close ${current_close:.2f})")
                 print(f"持倉量: {self.position_size}")
                 print(f"進場價: ${self.short_entry_price:.2f}")
 
@@ -1773,10 +1840,32 @@ class TradingStrategy:
             if self.position_size > 0:
                 if self.long_entry_price is None or self.long_entry_price <= 0:
                     return  # 靜默跳過
-                if self._handle_local_fixed_stop_fallback("long", current_close, current_time):
+                if self._handle_local_fixed_stop_fallback(
+                    "long", current_low, current_high, current_close, current_time
+                ):
                     return
 
-                # 更新峰值
+                # 步驟 1：先用「上一輪結束時」的 trail stop 檢查觸發，對齊回測
+                # check_stop_exit → update_trailing_stop 的順序（避免同一根 K 線啟用 trail 後立刻出場）
+                if (
+                    self.is_long_trail_active
+                    and self.long_trail_stop_price is not None
+                    and current_low <= self.long_trail_stop_price
+                ):
+                    print(f"\n\n🚨 === 多單移動停損觸發 ===")
+                    print(f"時間: {current_time}")
+                    print(f"觸發極值: ${current_low:.2f} (close ${current_close:.2f})")
+                    print(f"移動停損價: ${self.long_trail_stop_price:.2f}")
+                    print(f"持倉量: {self.position_size}")
+
+                    close_success = self._close_position(current_close)
+                    if close_success:
+                        print(f"✅ 多單移動停損平倉完成")
+                    else:
+                        print(f"❌ 多單移動停損平倉失敗")
+                    return  # 觸發後不再更新 trailing state，對齊回測
+
+                # 步驟 2：沒觸發才更新峰值
                 if self.long_peak is None:
                     self.long_peak = current_high
                 else:
@@ -1791,11 +1880,11 @@ class TradingStrategy:
                             f"\n\n📈 多單峰值更新: ${old_peak:.2f} → ${self.long_peak:.2f}"
                         )
 
-                # 檢查是否需要激活移動停損
+                # 步驟 3：沒觸發才檢查是否激活 trail（用 high 對齊回測 bar["high"] >= activate_price）
                 if (
                     not self.is_long_trail_active
-                    and current_close
-                    > self.long_entry_price
+                    and current_high
+                    >= self.long_entry_price
                     * (1 + self.long_trailing_activate_profit_percent)
                 ):
                     self.long_trail_stop_price = self.long_entry_price * (
@@ -1810,7 +1899,7 @@ class TradingStrategy:
                     )
                     self.save_state()
 
-                # 更新移動停損價格
+                # 步驟 4：沒觸發才更新 trail stop（下一輪才用到，避免本輪即啟即出）
                 if self.is_long_trail_active and self.long_peak is not None:
                     # 計算基於峰值回撤的停損價格
                     new_trail_stop = self.long_peak * (
@@ -1850,34 +1939,36 @@ class TradingStrategy:
                         )
                         self.save_state()
 
-                # 檢查移動停損觸發
-                long_trail_stop_triggered = (
-                    self.is_long_trail_active
-                    and self.long_trail_stop_price is not None
-                    and current_close <= self.long_trail_stop_price
-                )
-
-                if long_trail_stop_triggered:
-                    print(f"\n\n🚨 === 多單移動停損觸發 ===")
-                    print(f"時間: {current_time}")
-                    print(f"當前價格: ${current_close:.2f}")
-                    print(f"移動停損價: ${self.long_trail_stop_price:.2f}")
-                    print(f"持倉量: {self.position_size}")
-
-                    close_success = self._close_position(current_close)
-                    if close_success:
-                        print(f"✅ 多單移動停損平倉完成")
-                    else:
-                        print(f"❌ 多單移動停損平倉失敗")
-
             # --- 處理空單移動停損 ---
             elif self.position_size < 0:
                 if self.short_entry_price is None or self.short_entry_price <= 0:
                     return  # 靜默跳過
-                if self._handle_local_fixed_stop_fallback("short", current_close, current_time):
+                if self._handle_local_fixed_stop_fallback(
+                    "short", current_low, current_high, current_close, current_time
+                ):
                     return
 
-                # 更新谷值
+                # 步驟 1：先用「上一輪結束時」的 trail stop 檢查觸發，對齊回測
+                # check_stop_exit → update_trailing_stop 的順序（避免同一根 K 線啟用 trail 後立刻出場）
+                if (
+                    self.is_short_trail_active
+                    and self.short_trail_stop_price is not None
+                    and current_high >= self.short_trail_stop_price
+                ):
+                    print(f"\n\n🚨 === 空單移動停損觸發 ===")
+                    print(f"時間: {current_time}")
+                    print(f"觸發極值: ${current_high:.2f} (close ${current_close:.2f})")
+                    print(f"移動停損價: ${self.short_trail_stop_price:.2f}")
+                    print(f"持倉量: {self.position_size}")
+
+                    close_success = self._close_position(current_close)
+                    if close_success:
+                        print(f"✅ 空單移動停損平倉完成")
+                    else:
+                        print(f"❌ 空單移動停損平倉失敗")
+                    return  # 觸發後不再更新 trailing state，對齊回測
+
+                # 步驟 2：沒觸發才更新谷值
                 if self.short_trough is None:
                     self.short_trough = current_low
                 else:
@@ -1892,11 +1983,11 @@ class TradingStrategy:
                             f"\n\n📉 空單谷值更新: ${old_trough:.2f} → ${self.short_trough:.2f}"
                         )
 
-                # 檢查是否需要激活移動停損
+                # 步驟 3：沒觸發才檢查是否激活 trail（用 low 對齊回測 bar["low"] <= activate_price）
                 if (
                     not self.is_short_trail_active
-                    and current_close
-                    < self.short_entry_price
+                    and current_low
+                    <= self.short_entry_price
                     * (1 - self.short_trailing_activate_profit_percent)
                 ):
                     self.short_trail_stop_price = self.short_entry_price * (
@@ -1911,7 +2002,7 @@ class TradingStrategy:
                     )
                     self.save_state()
 
-                # 更新移動停損價格
+                # 步驟 4：沒觸發才更新 trail stop（下一輪才用到，避免本輪即啟即出）
                 if self.is_short_trail_active and self.short_trough is not None:
                     # 計算基於谷值回撤的停損價格
                     new_trail_stop = self.short_trough * (
@@ -1950,26 +2041,6 @@ class TradingStrategy:
                             "short", self.short_trail_stop_price, "空單移動停損更新"
                         )
                         self.save_state()
-
-                # 檢查移動停損觸發
-                short_trail_stop_triggered = (
-                    self.is_short_trail_active
-                    and self.short_trail_stop_price is not None
-                    and current_close >= self.short_trail_stop_price
-                )
-
-                if short_trail_stop_triggered:
-                    print(f"\n\n🚨 === 空單移動停損觸發 ===")
-                    print(f"時間: {current_time}")
-                    print(f"當前價格: ${current_close:.2f}")
-                    print(f"移動停損價: ${self.short_trail_stop_price:.2f}")
-                    print(f"持倉量: {self.position_size}")
-
-                    close_success = self._close_position(current_close)
-                    if close_success:
-                        print(f"✅ 空單移動停損平倉完成")
-                    else:
-                        print(f"❌ 空單移動停損平倉失敗")
 
         except Exception as e:
             print(f"❌ 移動停損檢查發生錯誤: {e}")
@@ -2066,7 +2137,7 @@ def run_live_trading():
     TRAILING_STOP_CHECK_SECONDS = 60  # 每60秒檢查一次移動停損
 
     # 每小時校正一次 JSON 狀態（避免手動干預造成狀態偏移）
-    last_state_sync_time = 0
+    last_state_sync_time = time.time()
     STATE_SYNC_INTERVAL_SECONDS = 3600
 
 
@@ -2085,13 +2156,12 @@ def run_live_trading():
                     strategy.check_trailing_stop_only()
                 last_trailing_stop_check_time = current_time
 
-
-                # 每小時與交易所同步一次狀態，校正JSON（進場價/方向/數量）
-                if current_time - last_state_sync_time >= STATE_SYNC_INTERVAL_SECONDS:
-                    try:
-                        strategy.sync_state_with_exchange(reason="每小時校正")
-                    finally:
-                        last_state_sync_time = current_time
+            # 每小時與交易所同步一次狀態，校正JSON（進場價/方向/數量）
+            if current_time - last_state_sync_time >= STATE_SYNC_INTERVAL_SECONDS:
+                try:
+                    strategy.sync_state_with_exchange(reason="每小時校正")
+                finally:
+                    last_state_sync_time = current_time
 
             # 每60秒檢查一次K線數據
             if current_time - last_check_time >= TRADE_SLEEP_SECONDS:
