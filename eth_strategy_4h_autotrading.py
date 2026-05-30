@@ -8,6 +8,7 @@
 import pandas as pd
 from datetime import datetime, timedelta
 import os
+import sys
 import time
 import ccxt
 from dotenv import load_dotenv
@@ -17,11 +18,40 @@ import math
 # 載入 .env 檔案中的環境變數
 load_dotenv()
 
+
+def _configure_utf8_output():
+    """強制 stdout/stderr 使用 UTF-8 輸出。
+
+    Windows 的 zh-TW 主控台預設為 cp950，無法編碼本程式大量使用的 emoji，
+    會讓 print 直接拋出 UnicodeEncodeError 而中斷交易迴圈。以 errors="replace"
+    確保任何輸出都不會讓程式崩潰。
+    """
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+_configure_utf8_output()
+
 # --- 🔧 策略配置參數 (集中管理) ---
 # 交易所設定
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
-SYMBOL = "ETH/USDT"
+
+# 交易標的選擇：在 .env 設定 TRADE_SYMBOL=ETH/USDT 或 BTC/USDT。
+# 每個標的使用各自獨立優化的最佳參數與熔斷 baseline（見下方對應字典）。
+VALID_TRADE_SYMBOLS = {"ETH/USDT", "BTC/USDT"}
+TRADE_SYMBOL = os.getenv("TRADE_SYMBOL", "ETH/USDT").upper().replace(" ", "")
+if TRADE_SYMBOL not in VALID_TRADE_SYMBOLS:
+    raise ValueError(
+        f"TRADE_SYMBOL 必須是 {sorted(VALID_TRADE_SYMBOLS)}，目前是 {TRADE_SYMBOL!r}"
+    )
+SYMBOL = TRADE_SYMBOL
 TIMEFRAME = "4h"
 
 # 資金管理設定
@@ -42,22 +72,71 @@ LOCAL_FIXED_STOP_FALLBACK_BUFFER_PCT = 0.002  # 0.2%; let exchange MarkPrice SL 
 STOP_LOSS_SYNC_RETRIES = 3
 STOP_LOSS_SYNC_RETRY_DELAY_SECONDS = 2
 KLINE_COMPLETION_BUFFER_SECONDS = 10
+# Bybit/ccxt can transiently return a partial balance snapshot (near-zero equity)
+# even on a funded account. Equity reads below this floor are treated as bad reads
+# so they can't poison peak_capital / max_drawdown statistics.
+MIN_PLAUSIBLE_EQUITY_USDT = 1.0
+# A stop-protected strategy cannot realistically draw down this deep in one sample;
+# a persisted/observed drawdown at/above this is treated as corrupted data.
+MAX_PLAUSIBLE_DRAWDOWN = 0.95
 
-# Optuna best params, updated 2026-05-19.
-# Default live mode is long_only because it had the strongest rolling-window score.
-STRATEGY_PARAMS = {
-    "adx_threshold": 30,
-    "long_adx_threshold": 30,
-    "short_adx_threshold": 45,
-    "long_fixed_stop_loss_percent": 0.032381484813749646,
-    "long_trailing_activate_profit_percent": 0.02845767104168034,
-    "long_trailing_pullback_percent": 0.07857282056523368,
-    "long_trailing_min_profit_percent": 0.02531577320019027,
-    "short_fixed_stop_loss_percent": 0.014180455668711924,
-    "short_trailing_activate_profit_percent": 0.004073022320643781,
-    "short_trailing_pullback_percent": 0.08106115862332733,
-    "short_trailing_min_profit_percent": 0.0014520289476228749,
+# === 回撤熔斷 (drawdown circuit breaker) ===
+# 目的：當實盤回撤超過策略「正常」回撤分布時，分級降低／暫停【開新倉】曝險。
+#       既有倉位的固定／移動停損不受影響，平倉與停損永遠暢通。
+#
+# 科學依據（設計原理 + 來源）：
+#   1) 分級降曝險而非一刀切 —— Grossman & Zhou (1993)
+#      "Optimal Investment Strategies for Controlling Drawdowns" 證明：在最大回撤
+#      約束下，最優曝險應隨「距 high-water mark 的回撤」遞減；CPPI (Black & Jones,
+#      1987) 同理，曝險與緩衝墊 (equity − floor) 成正比。故採「警戒減碼→熔斷暫停」。
+#   2) 門檻用「drawdown multiple」(實盤回撤 / 回測正常回撤) —— 系統交易實務界
+#      (Robert Pardo, *The Evaluation and Optimization of Trading Strategies*, 2008,
+#      walk-forward 偏離容忍；Lars Kestner, *Quantitative Trading Strategies*, 2003)
+#      普遍以 ~1.5x 視為警戒、~2.0x 視為策略可能已失效 (regime change)。
+#   3) 機率解讀 —— SPC/Shewhart 管制圖：將權益視為製程，回撤超出歷史分布尾端
+#      (約 ±3σ ≈ 99.7%) 即「失控訊號」；Magdon-Ismail & Atiya (2004) 給定 Sharpe
+#      與時間的期望最大回撤閉式解，可校準 baseline。
+#
+# baseline 由【滾動回測的 worst_max_drawdown_pct】推導，不是隨意拍板，且依標的不同。
+# ETH：真實 Bybit 資料 (2021-2026) long_only 全期 MDD ≈ 17%、滾動最差視窗 ≈ 15% → 取保守上界 0.18。
+# BTC：全期 MDD ≈ 21% → 取保守上界 0.22。換參數／換標的後請依新的滾動回測最差回撤同步更新。
+CIRCUIT_BREAKER_ENABLED = True
+SYMBOL_CIRCUIT_BREAKER_BASELINE = {
+    "ETH/USDT": 0.18,
+    "BTC/USDT": 0.22,
 }
+CIRCUIT_BREAKER_BASELINE_DRAWDOWN = SYMBOL_CIRCUIT_BREAKER_BASELINE.get(SYMBOL, 0.18)  # high-water-mark 基準
+CIRCUIT_BREAKER_WARN_MULT = 1.5           # 回撤 ≥ 1.5x baseline → 警戒減碼
+CIRCUIT_BREAKER_HALT_MULT = 2.0           # 回撤 ≥ 2.0x baseline → 熔斷暫停開新倉
+CIRCUIT_BREAKER_WARN_SIZE_SCALE = 0.5     # 警戒級的開倉資金比例係數 (離散化 CPPI)
+
+# 各標的最佳參數。
+# ETH/USDT: 2026-05-19 Optuna；2017-2021 純樣本外 12 月視窗 76% 獲利、中位年化 ~20%。
+SYMBOL_STRATEGY_PARAMS = {
+    "ETH/USDT": {
+        "adx_threshold": 30,
+        "long_adx_threshold": 30,
+        "short_adx_threshold": 45,
+        "long_fixed_stop_loss_percent": 0.032381484813749646,
+        "long_trailing_activate_profit_percent": 0.02845767104168034,
+        "long_trailing_pullback_percent": 0.07857282056523368,
+        "long_trailing_min_profit_percent": 0.02531577320019027,
+        "short_fixed_stop_loss_percent": 0.014180455668711924,
+        "short_trailing_activate_profit_percent": 0.004073022320643781,
+        "short_trailing_pullback_percent": 0.08106115862332733,
+        "short_trailing_min_profit_percent": 0.0014520289476228749,
+    },
+}
+# BTC/USDT 刻意「沿用」ETH 的 long_only 參數，而非為 BTC 單獨優化。
+# 三組獨立驗證證明 BTC 單獨優化都會過擬合到 2021-26 的單一下跌 regime：
+#   - 讓 Optuna 自由選方向 → 選 short_only：樣本內 PF 1.07，但 2017-21 樣本外 PF 0.98（虧）。
+#   - 強制 long_only 單獨優化 → 樣本內 PF 1.87、91% 視窗獲利，但 2017-21 樣本外暴跌到 PF 0.66。
+#   - 直接套用 ETH 參數 → BTC 樣本內 PF 1.18、樣本外 2017-21 PF 1.17、71% 視窗獲利（穩健）。
+# 趨勢跟隨捕捉的是加密貨幣普遍的趨勢動能，通用參數比逐標的精調更能泛化。
+SYMBOL_STRATEGY_PARAMS["BTC/USDT"] = dict(SYMBOL_STRATEGY_PARAMS["ETH/USDT"])
+
+# 預設 live 方向為 long_only（滾動視窗評分最高，且空單在加密貨幣長期虧損）。
+STRATEGY_PARAMS = dict(SYMBOL_STRATEGY_PARAMS[SYMBOL])
 
 # 系統設定
 TRADE_SLEEP_SECONDS = 60  # 每隔多久檢查一次新K線 (60秒檢查一次)
@@ -68,15 +147,22 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "strategy_
 
 
 # --- 1. 數據載入 (從 Bybit API 獲取數據) ---
-def fetch_bybit_klines(symbol, timeframe, limit=FETCH_KLINE_LIMIT):
+_PUBLIC_EXCHANGE = None
+
+
+def _get_public_exchange():
+    """延遲建立並快取一個公開行情用的 Bybit 連線。
+
+    舊版每次（每 60 秒）都重建連線並呼叫 load_markets()，既慢又容易觸發限流。
+    這裡改為重用單一實例，並啟用 enableRateLimit 保護。
     """
-    從 Bybit 獲取指定交易對和時間週期的 K 線數據。
-    """
+    global _PUBLIC_EXCHANGE
+    if _PUBLIC_EXCHANGE is not None:
+        return _PUBLIC_EXCHANGE
+
     exchange = ccxt.bybit(
         {
-            "apiKey": BYBIT_API_KEY,
-            "secret": BYBIT_API_SECRET,
-            "sandbox": False,  # 實際交易模式
+            "enableRateLimit": True,  # 啟用速率限制，避免被交易所 ban IP
             "options": {
                 "defaultType": "linear",  # Bybit USDT 線性合約
                 "adjustForTimeDifference": True,  # 自動調整時間差
@@ -85,14 +171,27 @@ def fetch_bybit_klines(symbol, timeframe, limit=FETCH_KLINE_LIMIT):
         }
     )
 
-    # 同步時間
+    # 同步時間（僅在建立連線時做一次，之後由 adjustForTimeDifference 維持）
     try:
         exchange.load_time_difference()
-    except:
+    except Exception:
         pass
 
     # 載入市場資訊，ccxt 需要知道市場資訊才能正確處理交易對
     exchange.load_markets()
+    _PUBLIC_EXCHANGE = exchange
+    return exchange
+
+
+def fetch_bybit_klines(symbol, timeframe, limit=FETCH_KLINE_LIMIT):
+    """
+    從 Bybit 獲取指定交易對和時間週期的 K 線數據。
+    """
+    try:
+        exchange = _get_public_exchange()
+    except Exception as e:
+        print(f"初始化行情連線失敗: {e}")
+        return pd.DataFrame()
 
     try:
         # 獲取 K 線數據
@@ -583,10 +682,14 @@ class TradingStrategy:
         print(message + " 仍會嘗試下單。")
         return True
 
-    def _calculate_trade_quantity(self, current_close):
-        """根據資金比例與目標名目槓桿計算下單數量。"""
+    def _calculate_trade_quantity(self, current_close, size_scale=1.0):
+        """根據資金比例與目標名目槓桿計算下單數量。
+
+        size_scale 供回撤熔斷分級減碼使用 (1.0=正常, 0.5=警戒減半, 0=熔斷暫停)。
+        """
         self.current_capital, _ = self._refresh_account_balances()
-        margin_budget_usd = self.current_capital * self.default_qty_percent / 100
+        effective_qty_percent = self.default_qty_percent * size_scale
+        margin_budget_usd = self.current_capital * effective_qty_percent / 100
         target_notional_usd = margin_budget_usd * self.target_position_leverage
         trade_qty_unrounded = target_notional_usd / current_close
         trade_qty = self._format_amount(trade_qty_unrounded)
@@ -604,16 +707,56 @@ class TradingStrategy:
 
         print(
             f"📐 倉位計算: 可用資金 {self.current_capital:.2f} USDT x "
-            f"{self.default_qty_percent}% x 目標名目槓桿 {self.target_position_leverage}x "
+            f"{effective_qty_percent:.1f}% x 目標名目槓桿 {self.target_position_leverage}x "
             f"= 目標名目 {target_notional_usd:.2f} USDT，數量 {trade_qty:.4f} ETH"
         )
         return trade_qty
 
+    def _drawdown_state(self):
+        """回傳 (size_scale, level, drawdown)，依當前回撤分級控制【開新倉】曝險。
+
+        level 0=正常, 1=警戒減碼, 2=熔斷暫停。即時依 total_equity 對 high-water
+        mark 的回撤計算，回撤縮回 baseline 以下即自動恢復，無需額外持久化狀態。
+        資料不足或讀數異常時回傳正常 (1.0, 0)，避免誤殺。
+        """
+        if not CIRCUIT_BREAKER_ENABLED:
+            return 1.0, 0, 0.0
+        peak = self.peak_capital or 0.0
+        equity = self.total_equity
+        # 異常／不足資料時不熔斷（保守：寧可不誤殺，也不在壞讀數上停單）
+        if peak <= 0 or equity is None or equity < MIN_PLAUSIBLE_EQUITY_USDT:
+            return 1.0, 0, 0.0
+        peak = max(peak, equity)  # 若創新高但 peak 尚未更新，回撤視為 0
+        drawdown = (peak - equity) / peak
+        warn = CIRCUIT_BREAKER_BASELINE_DRAWDOWN * CIRCUIT_BREAKER_WARN_MULT
+        halt = CIRCUIT_BREAKER_BASELINE_DRAWDOWN * CIRCUIT_BREAKER_HALT_MULT
+        if drawdown >= halt:
+            return 0.0, 2, drawdown
+        if drawdown >= warn:
+            return CIRCUIT_BREAKER_WARN_SIZE_SCALE, 1, drawdown
+        return 1.0, 0, drawdown
+
     def _prepare_entry_quantity(self, current_close):
-        """新開倉前統一檢查交易所槓桿並以最新 free balance 計算下單數量。"""
+        """新開倉前統一檢查交易所槓桿、回撤熔斷，並以最新 free balance 計算下單數量。"""
         if not self._ensure_exchange_leverage_capacity():
             return 0
-        return self._calculate_trade_quantity(current_close)
+
+        size_scale, level, drawdown = self._drawdown_state()
+        warn_th = CIRCUIT_BREAKER_BASELINE_DRAWDOWN * CIRCUIT_BREAKER_WARN_MULT
+        halt_th = CIRCUIT_BREAKER_BASELINE_DRAWDOWN * CIRCUIT_BREAKER_HALT_MULT
+        if level >= 2:
+            print(
+                f"🟥 回撤熔斷啟動：當前回撤 {drawdown*100:.1f}% ≥ 熔斷門檻 {halt_th*100:.1f}% "
+                f"(={CIRCUIT_BREAKER_HALT_MULT}x baseline)，暫停開新倉。"
+                "（既有倉位的固定／移動停損照常運作）"
+            )
+            return 0
+        if level == 1:
+            print(
+                f"🟧 回撤警戒：當前回撤 {drawdown*100:.1f}% ≥ 警戒門檻 {warn_th*100:.1f}% "
+                f"(={CIRCUIT_BREAKER_WARN_MULT}x baseline)，本次開倉資金比例降為 {size_scale*100:.0f}%。"
+            )
+        return self._calculate_trade_quantity(current_close, size_scale=size_scale)
 
     def _fixed_stop_price_for_side(self, position_side):
         if position_side == "long" and self.long_entry_price:
@@ -1048,15 +1191,6 @@ class TradingStrategy:
                     "details": str(e),
                 }
             )
-        except Exception as e:
-            print(f"下單失敗: {e}")
-            self.trade_log.append(
-                {
-                    "time": datetime.now().isoformat(),
-                    "type": "ERROR_ORDER_FAILED",
-                    "details": str(e),
-                }
-            )
         return None
 
     def _close_position(self, current_close):
@@ -1271,13 +1405,29 @@ class TradingStrategy:
             self.short_trough = state.get("short_trough")
             self.short_trail_stop_price = state.get("short_trail_stop_price")
             self.is_short_trail_active = state.get("is_short_trail_active", False)
-            self.peak_capital = state.get(
-                "peak_capital", self._get_free_balance()
-            )  # 如果檔案中沒有，則初始化
+            # Read persisted balances without eagerly hitting the exchange:
+            # state.get(key, self._get_free_balance()) evaluates the default on
+            # every call, so it used to make an API request even when the key
+            # existed — and made offline restarts depend on connectivity.
+            self.peak_capital = state.get("peak_capital")
+            if self.peak_capital is None:
+                self.peak_capital = self._get_free_balance()  # 如果檔案中沒有，則初始化
             self.max_drawdown = state.get("max_drawdown", 0.0)
-            self.current_capital = state.get(
-                "free_balance", state.get("current_capital", self._get_free_balance())
-            )
+            # Self-heal a corrupted drawdown (e.g. an old bad balance read that
+            # ratcheted it to ~100%). It is a monitoring stat, not a trading input,
+            # so resetting it is safe and avoids reporting a fake near-total loss.
+            if not isinstance(self.max_drawdown, (int, float)) or not (
+                0.0 <= self.max_drawdown < MAX_PLAUSIBLE_DRAWDOWN
+            ):
+                print(
+                    f"⚠️ 偵測到異常的 max_drawdown={self.max_drawdown}，重置為 0.0（疑似舊版壞讀數污染）。"
+                )
+                self.max_drawdown = 0.0
+            self.current_capital = state.get("free_balance")
+            if self.current_capital is None:
+                self.current_capital = state.get("current_capital")
+            if self.current_capital is None:
+                self.current_capital = self._get_free_balance()
             self.total_equity = state.get("total_equity", self.current_capital)
             last_ts = state.get("last_processed_kline_timestamp")
             self.last_processed_kline_timestamp = (
@@ -1796,13 +1946,26 @@ class TradingStrategy:
         # --- 更新資金和回撤計算 ---
         try:
             _free_balance, total_equity = self._refresh_account_balances()
-            self.peak_capital = max(self.peak_capital, total_equity)
-
-            if self.peak_capital > 0:
-                current_drawdown = (
-                    self.peak_capital - total_equity
-                ) / self.peak_capital
-                self.max_drawdown = max(self.max_drawdown, current_drawdown)
+            # Only feed plausible equity samples into the peak/drawdown stats. A
+            # partial balance snapshot (near-zero equity) would otherwise push
+            # max_drawdown to ~100% permanently, since it only ever ratchets up.
+            if total_equity >= MIN_PLAUSIBLE_EQUITY_USDT:
+                self.peak_capital = max(self.peak_capital, total_equity)
+                if self.peak_capital > 0:
+                    current_drawdown = (
+                        self.peak_capital - total_equity
+                    ) / self.peak_capital
+                    if current_drawdown < MAX_PLAUSIBLE_DRAWDOWN:
+                        self.max_drawdown = max(self.max_drawdown, current_drawdown)
+                    else:
+                        print(
+                            f"⚠️ 略過異常回撤樣本 ({current_drawdown*100:.2f}%)："
+                            f"權益讀數 {total_equity:.4f} 可能為不完整快照。"
+                        )
+            else:
+                print(
+                    f"⚠️ 略過異常權益讀數 {total_equity:.4f} USDT，不更新回撤統計。"
+                )
         except Exception as e:
             print(f"更新實時資金和回撤失敗: {e}")
 

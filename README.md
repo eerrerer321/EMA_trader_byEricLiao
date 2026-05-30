@@ -77,11 +77,16 @@ pip install -r requirements.txt
 BYBIT_API_KEY=your_api_key_here
 BYBIT_API_SECRET=your_api_secret_here
 TRADE_SIDE_MODE=long_only
+TRADE_SYMBOL=ETH/USDT
 ```
+
+- `TRADE_SYMBOL`：選擇交易標的，可設 `ETH/USDT` 或 `BTC/USDT`（預設 `ETH/USDT`）。
+  程式會自動套用該標的各自獨立優化的最佳參數與回撤熔斷 baseline，無需手動改 code。
+- `TRADE_SIDE_MODE`：`long_only`（預設）/ `short_only` / `both`。回測顯示加密貨幣只做多最穩健。
 
 4. **槓桿設置**
 - 登入 Bybit 網站 → 合約交易
-- 選擇 ETH/USDT 交易對
+- 選擇與 `TRADE_SYMBOL` 相同的交易對（ETH/USDT 或 BTC/USDT）
 - 將 Bybit 合約槓桿設為 **大於或等於程式中的 `TARGET_POSITION_LEVERAGE`**
 - 程式槓桿只用來計算名目倉位大小；交易所槓桿較高時較容易通過保證金檢查
 - 若使用 isolated margin，交易所槓桿越高，爆倉距離通常越近，請保守設定

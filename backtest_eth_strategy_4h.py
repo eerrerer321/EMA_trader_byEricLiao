@@ -24,6 +24,7 @@ import ccxt
 import pandas as pd
 
 from eth_strategy_4h_autotrading import (
+    ALLOW_SAME_BAR_REVERSAL,
     DEFAULT_QTY_PERCENT,
     STRATEGY_PARAMS,
     SYMBOL,
@@ -217,6 +218,27 @@ def close_position(
     }
 
 
+def circuit_breaker_scale(drawdown: float, cb: dict[str, float] | None) -> float:
+    """Entry size scale for the drawdown circuit breaker (same semantics as the
+    live engine's _drawdown_state).
+
+    cb=None disables it (always 1.0). ``drawdown`` is the equity drop from its
+    running high-water mark. Rationale: Grossman-Zhou (1993) / CPPI tiered de-
+    risking, with drawdown-multiple thresholds (~1.5x warn, ~2.0x halt) used as
+    strategy-decay tripwires in walk-forward practice (Pardo 2008, Kestner 2003).
+    """
+    if not cb:
+        return 1.0
+    baseline = cb.get("baseline_drawdown", 0.18)
+    warn = baseline * cb.get("warn_mult", 1.5)
+    halt = baseline * cb.get("halt_mult", 2.0)
+    if drawdown >= halt:
+        return 0.0
+    if drawdown >= warn:
+        return cb.get("warn_size_scale", 0.5)
+    return 1.0
+
+
 def open_position(
     side: str,
     entry_time: pd.Timestamp,
@@ -330,7 +352,12 @@ def summarize(
         (equity_curve["timestamp"].iloc[-1] - equity_curve["timestamp"].iloc[0]).days,
         1,
     )
-    cagr = (final_equity / initial_capital) ** (365 / days) - 1
+    # A non-positive final equity (account wiped out) makes the fractional power
+    # undefined; report it as a total loss instead of crashing with a complex/NaN.
+    if final_equity > 0 and initial_capital > 0:
+        cagr = (final_equity / initial_capital) ** (365 / days) - 1
+    else:
+        cagr = -1.0
     mdd = max_drawdown(equity_curve)
 
     if trades.empty:
@@ -383,6 +410,8 @@ def run_backtest(
     exit_on_reverse_signal: bool = True,
     allow_long: bool = True,
     allow_short: bool = True,
+    allow_same_bar_reversal: bool = ALLOW_SAME_BAR_REVERSAL,
+    circuit_breaker: dict[str, float] | None = None,
 ) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
     required_indicator_columns = {"ema90", "ema200", "adx", "rsi"}
     if required_indicator_columns.issubset(raw_df.columns):
@@ -404,6 +433,7 @@ def run_backtest(
         raise ValueError("Not enough candles inside requested trade window")
 
     equity = float(initial_capital)
+    equity_peak = float(initial_capital)  # high-water mark for circuit-breaker drawdown
     position: Position | None = None
     trades: list[dict[str, Any]] = []
     equity_rows: list[dict[str, Any]] = []
@@ -416,6 +446,7 @@ def run_backtest(
         signal_long = long_signal(signal_bar, params)
         signal_short = short_signal(signal_bar, params)
 
+        reversed_this_bar = False
         if position is not None and exit_on_reverse_signal:
             should_reverse = (
                 position.side == "long"
@@ -435,26 +466,39 @@ def run_backtest(
                 equity += trade["net_pnl"]
                 trades.append(trade)
                 position = None
+                reversed_this_bar = True
 
-        if position is None:
-            if signal_long and allow_long:
+        # The live engine closes on a reverse signal and waits for the next bar
+        # before opening the opposite side (ALLOW_SAME_BAR_REVERSAL=False), so by
+        # default the backtest must not flip on the same bar either.
+        if position is None and (allow_same_bar_reversal or not reversed_this_bar):
+            # Drawdown circuit breaker: scale (or halt) new-entry size by the
+            # equity drop from its high-water mark. Flat here, so equity == mark
+            # equity and the drawdown is measured correctly.
+            cb_drawdown = (
+                (equity_peak - equity) / equity_peak if equity_peak > 0 else 0.0
+            )
+            entry_qty_percent = qty_percent * circuit_breaker_scale(
+                cb_drawdown, circuit_breaker
+            )
+            if entry_qty_percent > 0 and signal_long and allow_long:
                 position = open_position(
                     "long",
                     timestamp,
                     float(bar["open"]),
                     equity,
-                    qty_percent,
+                    entry_qty_percent,
                     target_leverage,
                     fee_rate,
                     slippage_rate,
                 )
-            elif signal_short and allow_short:
+            elif entry_qty_percent > 0 and signal_short and allow_short:
                 position = open_position(
                     "short",
                     timestamp,
                     float(bar["open"]),
                     equity,
-                    qty_percent,
+                    entry_qty_percent,
                     target_leverage,
                     fee_rate,
                     slippage_rate,
@@ -480,6 +524,7 @@ def run_backtest(
                 position.bars_held += 1
 
         mark_equity = equity + calc_unrealized(position, float(bar["close"]))
+        equity_peak = max(equity_peak, mark_equity)
         equity_rows.append(
             {
                 "timestamp": timestamp,
