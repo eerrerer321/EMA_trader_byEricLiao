@@ -37,7 +37,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from trade_logger import log_event, write_active, ensure_log_header  # noqa: E402
 from eth_strategy_4h_autotrading import (  # noqa: E402
-    calculate_indicators, fetch_bybit_klines, get_latest_completed_bar, STRATEGY_PARAMS,
+    calculate_indicators, fetch_bybit_klines, get_latest_completed_bar, timeframe_to_timedelta,
+    STRATEGY_PARAMS,
 )
 from backtest_eth_strategy_4h import (  # noqa: E402
     Position, update_trailing_stop, check_stop_exit, long_signal, short_signal,
@@ -46,7 +47,7 @@ from harmonic_strategy import find_pivots, match, TP_RATIO, SL_BUFFER, QTY_PCT, 
 
 load_dotenv()
 API_KEY, API_SECRET = os.getenv("BYBIT_API_KEY"), os.getenv("BYBIT_API_SECRET")
-SYMBOL = os.getenv("HARMONIC_SYMBOL", "ETH/USDT")
+SYMBOL = (os.getenv("HARMONIC_SYMBOL") or os.getenv("TRADE_SYMBOL") or "ETH/USDT").upper().replace(" ", "")
 TREND_TF = "4h"
 HARM_TF = os.getenv("HARMONIC_TIMEFRAME", "1h")
 HARM_PIVOT_N = int(os.getenv("HARMONIC_PIVOT_N", "3"))
@@ -54,6 +55,8 @@ HARM_WAIT = 60
 DRY_RUN = os.getenv("HARMONIC_DRY_RUN", "1") != "0"
 STOP_TRIGGER_BY = "MarkPrice"
 POSITION_IDX = 0
+STOP_LOSS_SYNC_RETRIES = 3
+STOP_LOSS_SYNC_RETRY_DELAY_SECONDS = 2
 P = dict(STRATEGY_PARAMS)
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mixed_state.json")
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "mixed_trades.csv")
@@ -73,13 +76,14 @@ class MixedLiveTrader:
         self.ex.load_markets()
         self.symbol = SYMBOL
         self.bybit_symbol = self.ex.market(self.symbol).get("id", SYMBOL.replace("/", ""))
-        self.active = "none"        # none / trend / harm_pending / harm_pos
+        self.active = "none"        # none / trend / harm_pending / harm_pos / external_pos
         self.trend = None           # backtest Position
         self.harm = None            # dict
         self.last_signal_key = None  # 已處理過的諧波 C 樞軸，避免對同型態重複掛單
         self.last_4h = None
         self.last_1h = None
         self.load_state()
+        self._sync_with_exchange("啟動同步")
         ensure_log_header(LOG_FILE)  # 啟動即建立交易事件日誌（空表頭，待第一筆交易填入）
         self._write_active()  # 啟動即寫一次當前活躍快照（即使無持倉也立刻產生檔案）
         print(f"✅ 混合交易初始化 | {self.symbol} | 趨勢 {TREND_TF} + 諧波 {HARM_TF}(N={HARM_PIVOT_N}) "
@@ -112,16 +116,100 @@ class MixedLiveTrader:
         return qty if qty >= mn else 0.0
 
     def _exch_pos_size(self):
+        if DRY_RUN:
+            return 0.0
         try:
-            if hasattr(self.ex, "private_get_v5_position_list"):
-                for pos in self.ex.private_get_v5_position_list(
-                        {"category": "linear", "symbol": self.bybit_symbol}).get("result", {}).get("list", []):
-                    sz = float(pos.get("size", 0) or 0)
-                    if sz > 0:
-                        return sz if pos.get("side") == "Buy" else -sz
+            if not hasattr(self.ex, "private_get_v5_position_list"):
+                return None
+            for pos in self.ex.private_get_v5_position_list(
+                    {"category": "linear", "symbol": self.bybit_symbol}).get("result", {}).get("list", []):
+                sz = float(pos.get("size", 0) or 0)
+                if sz > 0:
+                    return sz if pos.get("side") == "Buy" else -sz
+            return 0.0
         except Exception as e:
             print(f"查持倉失敗: {e}")
-        return 0.0
+            return None
+
+    def _set_exchange_stop_loss(self, stop_price, reason):
+        if DRY_RUN:
+            return True
+        if not stop_price or stop_price <= 0:
+            return False
+        if not hasattr(self.ex, "private_post_v5_position_trading_stop"):
+            print("⚠️ 目前 ccxt 版本不支援 Bybit trading-stop，無法同步交易所端停損。")
+            return False
+
+        params = {
+            "category": "linear",
+            "symbol": self.bybit_symbol,
+            "tpslMode": "Full",
+            "positionIdx": POSITION_IDX,
+            "stopLoss": self._fmt_px(stop_price),
+            "slTriggerBy": STOP_TRIGGER_BY,
+            "slOrderType": "Market",
+        }
+        for attempt in range(1, STOP_LOSS_SYNC_RETRIES + 1):
+            try:
+                resp = self.ex.private_post_v5_position_trading_stop(params)
+                if resp.get("retCode") in (0, "0"):
+                    print(f"🛡️ [趨勢] 已同步交易所端停損 ({reason}) @ {params['stopLoss']}")
+                    return True
+                print(f"⚠️ 同步交易所端停損失敗 ({attempt}/{STOP_LOSS_SYNC_RETRIES}): {resp}")
+            except Exception as e:
+                print(f"⚠️ 同步交易所端停損失敗 ({attempt}/{STOP_LOSS_SYNC_RETRIES}): {e}")
+            if attempt < STOP_LOSS_SYNC_RETRIES:
+                time.sleep(STOP_LOSS_SYNC_RETRY_DELAY_SECONDS)
+        print("🚨 交易所端停損同步連續失敗，請人工確認 Bybit 保護停損。")
+        return False
+
+    def _sync_with_exchange(self, reason="同步"):
+        if DRY_RUN:
+            return
+        pos_size = self._exch_pos_size()
+        if pos_size is None:
+            print(f"⚠️ [{reason}] 無法確認交易所持倉，保留本地狀態並暫停同步決策。")
+            return
+        if pos_size == 0:
+            if self.active == "external_pos":
+                print(f"✅ [{reason}] 交易所已無外部持倉，回到等待。")
+                self.active = "none"
+                self.save_state()
+            elif self.active == "harm_pos":
+                print(f"✅ [{reason}] 諧波持倉已不在交易所，清除本地狀態。")
+                self.harm = None
+                self.active = "none"
+                self.save_state()
+            elif self.active == "trend" and self.trend is not None:
+                print(f"✅ [{reason}] 趨勢持倉已不在交易所，清除本地狀態。")
+                self.trend = None
+                self.active = "none"
+                self.save_state()
+            return
+
+        if self.active == "harm_pending" and self.harm is not None:
+            print(f"✅ [{reason}] 偵測到諧波掛單已成交，轉為持倉狀態。")
+            log_event(LOG_FILE, strategy="harmonic", timeframe=HARM_TF, action="fill",
+                      side="buy" if self.harm["bull"] else "sell", pattern=self.harm["pattern"],
+                      price=self.harm["entry"], qty=abs(pos_size), sl=round(self.harm["sl"], 2),
+                      tp=round(self.harm["tp"], 2), dry=False)
+            self.harm["qty"] = abs(pos_size)
+            self.active = "harm_pos"
+            self.save_state()
+            return
+
+        if self.active == "trend" and self.trend is not None:
+            self.trend.qty = abs(pos_size)
+            stop = self.trend.trail_stop if self.trend.trail_active and self.trend.trail_stop else (
+                self.trend.entry_price * (1 - P["long_fixed_stop_loss_percent"])
+            )
+            self._set_exchange_stop_loss(stop, reason)
+            return
+
+        if self.active in ("none", "harm_pending"):
+            print(f"⚠️ [{reason}] 偵測到交易所已有未記錄持倉 {pos_size}，暫停新訊號直到人工確認或持倉歸零。")
+            self.active = "external_pos"
+            self.save_state()
 
     def _market(self, side, qty, sl=None, tp=None):
         params = {"category": "linear", "positionIdx": POSITION_IDX, "reduceOnly": False}
@@ -145,17 +233,37 @@ class MixedLiveTrader:
 
     def _close_market(self, side):
         if DRY_RUN:
-            return
-        self.ex.create_order(self.symbol, "market", side, abs(self.trend.qty) if self.trend else 0,
-                             None, {"category": "linear", "positionIdx": POSITION_IDX, "reduceOnly": True})
+            return True
+        pos_size = self._exch_pos_size()
+        qty = abs(pos_size) if pos_size not in (None, 0) else (abs(self.trend.qty) if self.trend else 0)
+        if qty <= 0:
+            print("⚠️ 平倉前查無交易所持倉，保留本地狀態等待下次同步。")
+            return False
+        try:
+            self.ex.create_order(self.symbol, "market", side, qty, None,
+                                 {"category": "linear", "positionIdx": POSITION_IDX, "reduceOnly": True})
+            time.sleep(2)
+            final_pos = self._exch_pos_size()
+            if final_pos is None:
+                print("⚠️ 平倉後無法確認交易所持倉，保留本地狀態等待下次同步。")
+                return False
+            if final_pos != 0:
+                print("⚠️ 平倉後仍偵測到交易所持倉，請人工確認。")
+                return False
+            return True
+        except Exception as e:
+            print(f"❌ 平倉失敗: {e}")
+            return False
 
     def _cancel(self, oid):
         if DRY_RUN or not oid or oid == "DRY":
-            return
+            return True
         try:
             self.ex.cancel_order(oid, self.symbol, {"category": "linear"})
+            return True
         except Exception as e:
             print(f"撤單失敗(可能已成交): {e}")
+            return False
 
     # ---------- 趨勢（4h，重用回測邏輯） ----------
     def _open_trend(self, bar):
@@ -179,7 +287,8 @@ class MixedLiveTrader:
         if short_signal(bar, P):
             px = float(bar["close"]); pnl = (px - self.trend.entry_price) * self.trend.qty
             print("🔴 [趨勢] 反向訊號 → 平多")
-            self._close_market("sell")
+            if not self._close_market("sell"):
+                return
             log_event(LOG_FILE, strategy="trend", timeframe=TREND_TF, action="exit", side="sell",
                       price=round(px, 2), qty=self.trend.qty, reason="reverse", pnl=round(pnl, 2), dry=DRY_RUN)
             self.trend = None; self.active = "none"; self.save_state(); return
@@ -187,14 +296,18 @@ class MixedLiveTrader:
         if st:
             pnl = (st[1] - self.trend.entry_price) * self.trend.qty
             print(f"🔴 [趨勢] {st[0]} 觸發 @ {st[1]:.2f} → 平多")
-            self._close_market("sell")
+            if not self._close_market("sell"):
+                return
             log_event(LOG_FILE, strategy="trend", timeframe=TREND_TF, action="exit", side="sell",
                       price=round(st[1], 2), qty=self.trend.qty, reason=st[0], pnl=round(pnl, 2), dry=DRY_RUN)
             self.trend = None; self.active = "none"; self.save_state(); return
+        old_trail = self.trend.trail_stop
         update_trailing_stop(self.trend, bar, P)
         self.trend.bars_held += 1
         if self.trend.trail_active and self.trend.trail_stop:
-            print(f"   [趨勢] 移動停損更新 → {self.trend.trail_stop:.2f}（請同步交易所端）")
+            print(f"   [趨勢] 移動停損更新 → {self.trend.trail_stop:.2f}")
+            if old_trail != self.trend.trail_stop:
+                self._set_exchange_stop_loss(self.trend.trail_stop, "趨勢移動停損更新")
 
     # ---------- 諧波（1h） ----------
     def _detect_harm(self, df):
@@ -241,18 +354,38 @@ class MixedLiveTrader:
 
     def _cancel_harm(self, reason):
         if not self.harm:
-            return
+            return True
         print(f"🗑️ [諧波] 撤掛單（{reason}）")
+        cancelled = self._cancel(self.harm.get("order_id"))
+        if not cancelled:
+            pos_size = self._exch_pos_size()
+            if pos_size is not None and pos_size != 0:
+                print("⚠️ 撤單失敗且偵測到持倉，改列為諧波持倉，避免重複開倉。")
+                log_event(LOG_FILE, strategy="harmonic", timeframe=HARM_TF, action="fill",
+                          side="buy" if self.harm["bull"] else "sell", pattern=self.harm["pattern"],
+                          price=self.harm["entry"], qty=abs(pos_size), sl=round(self.harm["sl"], 2),
+                          tp=round(self.harm["tp"], 2), dry=False)
+                self.harm["qty"] = abs(pos_size)
+                self.active = "harm_pos"
+                self.save_state()
+                return False
+            print("⚠️ 撤單結果不明，保留掛單狀態，避免誤開新倉。")
+            self.save_state()
+            return False
         log_event(LOG_FILE, strategy="harmonic", timeframe=HARM_TF, action="cancel",
                   pattern=self.harm.get("pattern", ""), reason=reason, dry=DRY_RUN,
                   order_id=self.harm.get("order_id", ""))
-        self._cancel(self.harm.get("order_id"))
         self.harm = None
         self.active = "none"
         self.save_state()
+        return True
 
     def _manage_harm_pending(self, df):
-        if self._exch_pos_size() != 0 or (DRY_RUN and self._dry_harm_filled(df)):
+        pos_size = self._exch_pos_size()
+        if pos_size is None:
+            print("⚠️ 無法確認諧波掛單是否成交，保留掛單狀態。")
+            return
+        if pos_size != 0 or (DRY_RUN and self._dry_harm_filled(df)):
             print("✅ [諧波] 限價單成交 → 持倉（SL/TP 由交易所端執行）")
             log_event(LOG_FILE, strategy="harmonic", timeframe=HARM_TF, action="fill",
                       side="buy" if self.harm["bull"] else "sell", pattern=self.harm["pattern"],
@@ -262,7 +395,9 @@ class MixedLiveTrader:
         close = float(df["close"].iloc[-1]); bull = self.harm["bull"]
         if (bull and close < self.harm["x_price"]) or (not bull and close > self.harm["x_price"]):
             self._cancel_harm("價格突破 X，型態失效")
-        elif self.harm.get("placed") and (df.index[-1] - pd.Timestamp(self.harm["placed"])) > pd.Timedelta(hours=HARM_WAIT):
+        elif self.harm.get("placed") and (
+            df.index[-1] - pd.Timestamp(self.harm["placed"])
+        ) > timeframe_to_timedelta(HARM_TF) * HARM_WAIT:
             self._cancel_harm(f"超過 {HARM_WAIT} 根未成交")
 
     def _dry_harm_filled(self, df):
@@ -272,7 +407,11 @@ class MixedLiveTrader:
 
     def _monitor_harm(self, df):
         if not DRY_RUN:
-            if self._exch_pos_size() == 0:   # 實單：交易所端 SL/TP 已平倉
+            pos_size = self._exch_pos_size()
+            if pos_size is None:
+                print("⚠️ 無法確認諧波持倉狀態，保留本地狀態。")
+                return
+            if pos_size == 0:   # 實單：交易所端 SL/TP 已平倉
                 print("✅ [諧波] 持倉已由交易所 SL/TP 平倉 → 回到等待")
                 log_event(LOG_FILE, strategy="harmonic", timeframe=HARM_TF, action="exit",
                           pattern=self.harm.get("pattern", "") if self.harm else "",
@@ -301,7 +440,8 @@ class MixedLiveTrader:
         elif self.active in ("none", "harm_pending"):
             if long_signal(bar, P):
                 if self.active == "harm_pending":
-                    self._cancel_harm("趨勢優先")
+                    if not self._cancel_harm("趨勢優先"):
+                        return
                 self._open_trend(bar)
         # harm_pos: 趨勢讓步等諧波結束
 
@@ -362,6 +502,10 @@ class MixedLiveTrader:
                           "entry": round(self.harm["entry"], 2), "stop_loss": round(self.harm["sl"], 2),
                           "take_profit": round(self.harm["tp"], 2), "qty": self.harm["qty"],
                           "since": self.harm.get("placed", ""), "note": "等 SL/TP 觸發"})
+        elif self.active == "external_pos":
+            items.append({"status": "交易所已有未記錄持倉", "strategy": "external",
+                          "side": "", "pattern": "", "entry": "", "stop_loss": "",
+                          "take_profit": "", "qty": "", "since": "", "note": "暫停新訊號，請人工確認"})
         write_active(ACTIVE_FILE, items)
 
     def load_state(self):
@@ -386,8 +530,12 @@ class MixedLiveTrader:
     def run(self):
         print(f"--- 混合實盤啟動（互斥、趨勢優先）---  狀態: {self.active}")
         last = 0
+        last_sync = 0
         while True:
             try:
+                if not DRY_RUN and time.time() - last_sync >= 3600:
+                    self._sync_with_exchange("每小時同步")
+                    last_sync = time.time()
                 if time.time() - last >= 60:
                     df4 = calculate_indicators(fetch_bybit_klines(SYMBOL, TREND_TF, limit=300))
                     b4 = get_latest_completed_bar(df4, TREND_TF)

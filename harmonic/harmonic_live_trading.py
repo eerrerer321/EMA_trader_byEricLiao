@@ -26,7 +26,6 @@ import os
 import sys
 import time
 import warnings
-from datetime import timedelta
 
 # 靜音 requests 對 urllib3/chardet 版本的無害相容性警告（不影響運作）
 warnings.filterwarnings("ignore", message=".*doesn't match a supported version.*")
@@ -39,7 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from trade_logger import log_event  # noqa: E402
 from eth_strategy_4h_autotrading import (  # noqa: E402  複用已驗證的指標與 K 線抓取
-    calculate_indicators, fetch_bybit_klines, get_latest_completed_bar,
+    calculate_indicators, fetch_bybit_klines, get_latest_completed_bar, timeframe_to_timedelta,
 )
 from harmonic_strategy import (  # noqa: E402  複用偵測核心
     find_pivots, match, PIVOT_N, WAIT, TP_RATIO, SL_BUFFER, QTY_PCT, LEV,
@@ -50,7 +49,7 @@ load_dotenv()
 # --- 配置 ---
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
-SYMBOL = os.getenv("HARMONIC_SYMBOL", "ETH/USDT")
+SYMBOL = (os.getenv("HARMONIC_SYMBOL") or os.getenv("TRADE_SYMBOL") or "ETH/USDT").upper().replace(" ", "")
 TIMEFRAME = os.getenv("HARMONIC_TIMEFRAME", "1h")     # 推薦 1h：機會是 4h 的 3.7 倍且 edge 守住
 PIVOT_N_LIVE = int(os.getenv("HARMONIC_PIVOT_N", "3"))  # 樞軸大小（1h≈3, 30m≈8）
 DRY_RUN = os.getenv("HARMONIC_DRY_RUN", "1") != "0"   # 預設只觀察、不下單
@@ -113,14 +112,19 @@ class HarmonicTrader:
         return resp.get("result", {}).get("list", [])
 
     def _exchange_position_size(self):
+        if DRY_RUN:
+            return 0.0
         try:
+            if not hasattr(self.exchange, "private_get_v5_position_list"):
+                return None
             for pos in self._fetch_raw_positions():
                 size = float(pos.get("size", 0) or 0)
                 if size > 0:
                     return size if pos.get("side") == "Buy" else -size
+            return 0.0
         except Exception as e:
             print(f"查持倉失敗: {e}")
-        return 0.0
+            return None
 
     def _calc_qty(self, entry_price):
         free = self._free_balance()
@@ -129,6 +133,11 @@ class HarmonicTrader:
         market = self.exchange.market(self.symbol)
         min_amt = market["limits"]["amount"]["min"] if "amount" in market["limits"] else 0.001
         return qty if qty >= min_amt else 0.0
+
+    def _deadline_from(self, kline_time):
+        if kline_time is None:
+            return None
+        return kline_time + timeframe_to_timedelta(TIMEFRAME) * WAIT
 
     # ---------- 偵測（不重繪 + 順大勢） ----------
     def _detect_signal(self, df):
@@ -177,16 +186,19 @@ class HarmonicTrader:
               f"| SL {params['stopLoss']} TP {params['takeProfit']}")
         if DRY_RUN:
             print("   (DRY-RUN：不實際下單)")
+            self.pending = {"order_id": "DRY", "entry": entry, "sl": sig["sl"], "tp": sig["tp"],
+                            "bull": sig["bull"], "pattern": sig["pattern"], "x_price": sig["x_price"],
+                            "deadline": self._deadline_from(self.last_processed_kline), "qty": qty}
+            self.save_state()
             log_event(LOG_FILE, strategy="harmonic", timeframe=TIMEFRAME, action="place", side=side,
                       pattern=sig["pattern"], price=entry, qty=qty, sl=round(sig["sl"], 2),
                       tp=round(sig["tp"], 2), dry=True, note="dry-run")
-            return False
+            return True
         try:
             order = self.exchange.create_order(self.symbol, "limit", side, qty, entry, params)
             self.pending = {"order_id": order.get("id"), "entry": entry, "sl": sig["sl"], "tp": sig["tp"],
                             "bull": sig["bull"], "pattern": sig["pattern"], "x_price": sig["x_price"],
-                            "deadline": (self.last_processed_kline + timedelta(hours=4 * WAIT))
-                            if self.last_processed_kline else None}
+                            "deadline": self._deadline_from(self.last_processed_kline), "qty": qty}
             self.save_state()
             print(f"   ✅ 已掛單 id={order.get('id')}")
             log_event(LOG_FILE, strategy="harmonic", timeframe=TIMEFRAME, action="place", side=side,
@@ -199,27 +211,43 @@ class HarmonicTrader:
 
     def _cancel_pending(self, reason):
         if not self.pending:
-            return
+            return True
         print(f"🗑️ 撤銷掛單 ({reason}) id={self.pending.get('order_id')}")
-        log_event(LOG_FILE, strategy="harmonic", timeframe=TIMEFRAME, action="cancel",
-                  pattern=self.pending.get("pattern", ""), reason=reason, dry=DRY_RUN,
-                  order_id=self.pending.get("order_id", ""))
         if not DRY_RUN:
             try:
                 self.exchange.cancel_order(self.pending["order_id"], self.symbol, {"category": "linear"})
             except Exception as e:
                 print(f"   撤單失敗(可能已成交/已撤): {e}")
+                pos_size = self._exchange_position_size()
+                if pos_size is not None and pos_size != 0:
+                    print("⚠️ 撤單失敗且偵測到持倉，改列為諧波持倉，避免重複開倉。")
+                    self.position = {**self.pending, "qty": abs(pos_size)}
+                    self.pending = None
+                    self.save_state()
+                    return False
+                print("⚠️ 撤單結果不明，保留掛單狀態，避免誤開新倉。")
+                self.save_state()
+                return False
+        log_event(LOG_FILE, strategy="harmonic", timeframe=TIMEFRAME, action="cancel",
+                  pattern=self.pending.get("pattern", ""), reason=reason, dry=DRY_RUN,
+                  order_id=self.pending.get("order_id", ""))
         self.pending = None
         self.save_state()
+        return True
 
     def _check_pending(self, df):
         """掛單未成交時：偵測是否已成交 / 型態失效需撤單。"""
         pos_size = self._exchange_position_size()
-        if pos_size != 0:   # 已成交 → 轉持倉（SL/TP 已掛交易所端）
-            self.position = {**self.pending, "qty": abs(pos_size)}
+        if pos_size is None:
+            print("⚠️ 無法確認掛單是否成交，保留掛單狀態。")
+            return
+        dry_filled = DRY_RUN and self._dry_pending_filled(df)
+        if pos_size != 0 or dry_filled:   # 已成交 → 轉持倉（SL/TP 已掛交易所端）
+            qty = self.pending.get("qty", abs(pos_size)) if DRY_RUN else abs(pos_size)
+            self.position = {**self.pending, "qty": qty}
             log_event(LOG_FILE, strategy="harmonic", timeframe=TIMEFRAME, action="fill",
                       side="buy" if self.pending["bull"] else "sell", pattern=self.pending["pattern"],
-                      price=self.pending["entry"], qty=abs(pos_size), sl=round(self.pending["sl"], 2),
+                      price=self.pending["entry"], qty=qty, sl=round(self.pending["sl"], 2),
                       tp=round(self.pending["tp"], 2), dry=DRY_RUN)
             self.pending = None
             self.save_state()
@@ -231,6 +259,32 @@ class HarmonicTrader:
             self._cancel_pending("價格突破 X，型態失效")
         elif self.pending.get("deadline") and self.last_processed_kline and self.last_processed_kline >= self.pending["deadline"]:
             self._cancel_pending("超過等待期限未成交")
+
+    def _dry_pending_filled(self, df):
+        bull = self.pending["bull"]
+        hi, lo = float(df["high"].iloc[-1]), float(df["low"].iloc[-1])
+        return (lo <= self.pending["entry"]) if bull else (hi >= self.pending["entry"])
+
+    def _monitor_dry_position(self, df):
+        if self.position.get("sl") is None or self.position.get("tp") is None:
+            print("⚠️ DRY-RUN 持倉缺少 SL/TP，保留狀態等待人工確認。")
+            return
+        hi, lo, bull = float(df["high"].iloc[-1]), float(df["low"].iloc[-1]), self.position["bull"]
+        if bull:
+            hit = "SL" if lo <= self.position["sl"] else ("TP" if hi >= self.position["tp"] else None)
+        else:
+            hit = "SL" if hi >= self.position["sl"] else ("TP" if lo <= self.position["tp"] else None)
+        if not hit:
+            return
+        px = self.position["sl"] if hit == "SL" else self.position["tp"]
+        pnl = ((px - self.position["entry"]) if bull else (self.position["entry"] - px)) * self.position["qty"]
+        log_event(LOG_FILE, strategy="harmonic", timeframe=TIMEFRAME, action="exit",
+                  side="sell" if bull else "buy", pattern=self.position["pattern"], price=round(px, 2),
+                  qty=self.position["qty"], reason=hit, pnl=round(pnl, 2), dry=True)
+        print(f"✅ (DRY) {hit} 觸及 @ {px:.2f}，回到等待型態。")
+        self.position = None
+        self.last_signal_key = None
+        self.save_state()
 
     # ---------- 狀態 ----------
     def save_state(self):
@@ -262,7 +316,12 @@ class HarmonicTrader:
 
     def _sync_with_exchange(self):
         """以交易所實際持倉校正本地狀態（重啟/手動干預後）。"""
+        if DRY_RUN:
+            return
         pos_size = self._exchange_position_size()
+        if pos_size is None:
+            print("⚠️ 無法確認交易所持倉，保留本地狀態。")
+            return
         if pos_size == 0:
             if self.position:
                 print("交易所已無持倉，清除本地持倉狀態。")
@@ -270,12 +329,22 @@ class HarmonicTrader:
         else:
             if not self.position:
                 print(f"⚠️ 偵測到未記錄的持倉 {pos_size}，SL/TP 請自行於 Bybit 確認。")
+                self.position = {"order_id": "", "entry": None, "sl": None, "tp": None,
+                                 "bull": pos_size > 0, "pattern": "external", "qty": abs(pos_size)}
+                self.save_state()
 
     # ---------- 主流程 ----------
     def process(self, bar, df):
         # 1) 有持倉：交易所端 SL/TP 自動執行，僅監控
         if self.position is not None:
-            if self._exchange_position_size() == 0:
+            if DRY_RUN:
+                self._monitor_dry_position(df)
+                return
+            pos_size = self._exchange_position_size()
+            if pos_size is None:
+                print("⚠️ 無法確認持倉狀態，保留本地狀態。")
+                return
+            if pos_size == 0:
                 print("✅ 持倉已由交易所端 SL/TP 平倉，回到等待型態。")
                 log_event(LOG_FILE, strategy="harmonic", timeframe=TIMEFRAME, action="exit",
                           pattern=self.position.get("pattern", ""), reason="exchange_sl_tp", dry=DRY_RUN)
@@ -299,6 +368,8 @@ class HarmonicTrader:
         while True:
             try:
                 now = time.time()
+                if not DRY_RUN and now - last_check >= TRADE_SLEEP_SECONDS:
+                    self._sync_with_exchange()
                 if now - last_check >= TRADE_SLEEP_SECONDS:
                     df = calculate_indicators(fetch_bybit_klines(SYMBOL, TIMEFRAME, limit=500))
                     bar = get_latest_completed_bar(df, TIMEFRAME)
