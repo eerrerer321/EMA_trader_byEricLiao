@@ -24,6 +24,10 @@ import json
 import os
 import sys
 import time
+import warnings
+
+# 靜音 requests 對 urllib3/chardet 版本的無害相容性警告（不影響運作）
+warnings.filterwarnings("ignore", message=".*doesn't match a supported version.*")
 
 import ccxt
 import pandas as pd
@@ -31,7 +35,7 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from trade_logger import log_event  # noqa: E402
+from trade_logger import log_event, write_active, ensure_log_header  # noqa: E402
 from eth_strategy_4h_autotrading import (  # noqa: E402
     calculate_indicators, fetch_bybit_klines, get_latest_completed_bar, STRATEGY_PARAMS,
 )
@@ -53,6 +57,7 @@ POSITION_IDX = 0
 P = dict(STRATEGY_PARAMS)
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mixed_state.json")
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "mixed_trades.csv")
+ACTIVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "mixed_active.csv")
 
 
 class MixedLiveTrader:
@@ -71,11 +76,15 @@ class MixedLiveTrader:
         self.active = "none"        # none / trend / harm_pending / harm_pos
         self.trend = None           # backtest Position
         self.harm = None            # dict
+        self.last_signal_key = None  # 已處理過的諧波 C 樞軸，避免對同型態重複掛單
         self.last_4h = None
         self.last_1h = None
         self.load_state()
+        ensure_log_header(LOG_FILE)  # 啟動即建立交易事件日誌（空表頭，待第一筆交易填入）
+        self._write_active()  # 啟動即寫一次當前活躍快照（即使無持倉也立刻產生檔案）
         print(f"✅ 混合交易初始化 | {self.symbol} | 趨勢 {TREND_TF} + 諧波 {HARM_TF}(N={HARM_PIVOT_N}) "
               f"| {'🟡 DRY-RUN' if DRY_RUN else '🔴 實單'} | 目前狀態: {self.active}")
+        print(f"   📒 日誌：logs/mixed_trades.csv（交易事件流）｜ logs/mixed_active.csv（當前活躍快照）")
 
     # ---------- 基礎 ----------
     def _fmt_amt(self, a):
@@ -214,7 +223,7 @@ class MixedLiveTrader:
         return {"entry": entry, "sl": sl, "tp": tp, "bull": bull, "pattern": name,
                 "x_price": X[2], "c_time": str(C[1])}
 
-    def _place_harm(self, sig):
+    def _place_harm(self, sig, placed_time=None):
         entry = float(self._fmt_px(sig["entry"]))
         qty = self._calc_qty(entry)
         if qty <= 0:
@@ -223,7 +232,7 @@ class MixedLiveTrader:
         print(f"🎯 [諧波] {sig['pattern']} {'多' if sig['bull'] else '空'} 掛限價 {side} {qty} @ {entry} "
               f"| SL {sig['sl']:.2f} TP {sig['tp']:.2f}")
         order = self._limit(side, qty, entry, sig["sl"], sig["tp"])
-        self.harm = {**sig, "order_id": order.get("id"), "qty": qty}
+        self.harm = {**sig, "order_id": order.get("id"), "qty": qty, "placed": str(placed_time) if placed_time is not None else ""}
         self.active = "harm_pending"
         log_event(LOG_FILE, strategy="harmonic", timeframe=HARM_TF, action="place", side=side,
                   pattern=sig["pattern"], price=entry, qty=qty, sl=round(sig["sl"], 2), tp=round(sig["tp"], 2),
@@ -253,18 +262,36 @@ class MixedLiveTrader:
         close = float(df["close"].iloc[-1]); bull = self.harm["bull"]
         if (bull and close < self.harm["x_price"]) or (not bull and close > self.harm["x_price"]):
             self._cancel_harm("價格突破 X，型態失效")
+        elif self.harm.get("placed") and (df.index[-1] - pd.Timestamp(self.harm["placed"])) > pd.Timedelta(hours=HARM_WAIT):
+            self._cancel_harm(f"超過 {HARM_WAIT} 根未成交")
 
     def _dry_harm_filled(self, df):
         """DRY-RUN 模擬：最新 1h K 線是否觸及限價。"""
         bull = self.harm["bull"]; hi, lo = float(df["high"].iloc[-1]), float(df["low"].iloc[-1])
         return (lo <= self.harm["entry"]) if bull else (hi >= self.harm["entry"])
 
-    def _monitor_harm(self):
-        if self._exch_pos_size() == 0 and not DRY_RUN:
-            print("✅ [諧波] 持倉已由交易所 SL/TP 平倉 → 回到等待")
+    def _monitor_harm(self, df):
+        if not DRY_RUN:
+            if self._exch_pos_size() == 0:   # 實單：交易所端 SL/TP 已平倉
+                print("✅ [諧波] 持倉已由交易所 SL/TP 平倉 → 回到等待")
+                log_event(LOG_FILE, strategy="harmonic", timeframe=HARM_TF, action="exit",
+                          pattern=self.harm.get("pattern", "") if self.harm else "",
+                          reason="exchange_sl_tp", dry=False)
+                self.harm = None; self.active = "none"; self.save_state()
+            return
+        # DRY-RUN：用最新 K 線模擬交易所端 SL/TP 觸發（否則持倉會卡住不出場）
+        hi, lo, bull = float(df["high"].iloc[-1]), float(df["low"].iloc[-1]), self.harm["bull"]
+        if bull:
+            hit = "SL" if lo <= self.harm["sl"] else ("TP" if hi >= self.harm["tp"] else None)
+        else:
+            hit = "SL" if hi >= self.harm["sl"] else ("TP" if lo <= self.harm["tp"] else None)
+        if hit:
+            px = self.harm["sl"] if hit == "SL" else self.harm["tp"]
+            pnl = ((px - self.harm["entry"]) if bull else (self.harm["entry"] - px)) * self.harm["qty"]
+            print(f"✅ [諧波] (DRY) {hit} 觸及 @ {px:.2f} → 平倉")
             log_event(LOG_FILE, strategy="harmonic", timeframe=HARM_TF, action="exit",
-                      pattern=self.harm.get("pattern", "") if self.harm else "",
-                      reason="exchange_sl_tp", dry=DRY_RUN)
+                      side="sell" if bull else "buy", pattern=self.harm["pattern"], price=round(px, 2),
+                      qty=self.harm["qty"], reason=hit, pnl=round(pnl, 2), dry=True)
             self.harm = None; self.active = "none"; self.save_state()
 
     # ---------- 協調 ----------
@@ -284,11 +311,12 @@ class MixedLiveTrader:
         if self.active == "harm_pending":
             self._manage_harm_pending(df)
         elif self.active == "harm_pos":
-            self._monitor_harm()
+            self._monitor_harm(df)
         elif self.active == "none":
             sig = self._detect_harm(df)
-            if sig:
-                self._place_harm(sig)
+            if sig and sig["c_time"] != self.last_signal_key:
+                self.last_signal_key = sig["c_time"]
+                self._place_harm(sig, bar.name)
 
     # ---------- 狀態 ----------
     def save_state(self):
@@ -299,6 +327,7 @@ class MixedLiveTrader:
                   "trail_active": self.trend.trail_active, "trail_stop": self.trend.trail_stop,
                   "bars_held": self.trend.bars_held}
         st = {"active": self.active, "trend": tp, "harm": self.harm,
+              "last_signal_key": self.last_signal_key,
               "last_4h": str(self.last_4h) if self.last_4h is not None else None,
               "last_1h": str(self.last_1h) if self.last_1h is not None else None}
         try:
@@ -308,6 +337,32 @@ class MixedLiveTrader:
             os.replace(tmp, STATE_FILE)
         except Exception as e:
             print(f"存檔失敗: {e}")
+        self._write_active()
+
+    def _write_active(self):
+        """更新『當前活躍』快照：只列尚未停利/停損的掛單與持倉（互斥下 0~1 筆）。"""
+        items = []
+        if self.active == "trend" and self.trend is not None:
+            if self.trend.trail_active and self.trend.trail_stop:
+                sl, note = self.trend.trail_stop, "移動停損保護中"
+            else:
+                sl, note = self.trend.entry_price * (1 - P["long_fixed_stop_loss_percent"]), "固定停損"
+            items.append({"status": "趨勢持倉中", "strategy": "trend", "side": "long", "pattern": "",
+                          "entry": round(self.trend.entry_price, 2), "stop_loss": round(sl, 2),
+                          "take_profit": "", "qty": self.trend.qty, "since": str(self.trend.entry_time), "note": note})
+        elif self.active == "harm_pending" and self.harm is not None:
+            items.append({"status": "諧波掛單等待成交", "strategy": "harmonic",
+                          "side": "buy" if self.harm["bull"] else "sell", "pattern": self.harm["pattern"],
+                          "entry": round(self.harm["entry"], 2), "stop_loss": round(self.harm["sl"], 2),
+                          "take_profit": round(self.harm["tp"], 2), "qty": self.harm["qty"],
+                          "since": self.harm.get("placed", ""), "note": "等價格觸及 PRZ"})
+        elif self.active == "harm_pos" and self.harm is not None:
+            items.append({"status": "諧波持倉中", "strategy": "harmonic",
+                          "side": "buy" if self.harm["bull"] else "sell", "pattern": self.harm["pattern"],
+                          "entry": round(self.harm["entry"], 2), "stop_loss": round(self.harm["sl"], 2),
+                          "take_profit": round(self.harm["tp"], 2), "qty": self.harm["qty"],
+                          "since": self.harm.get("placed", ""), "note": "等 SL/TP 觸發"})
+        write_active(ACTIVE_FILE, items)
 
     def load_state(self):
         if not os.path.exists(STATE_FILE):
@@ -315,6 +370,7 @@ class MixedLiveTrader:
         try:
             s = json.load(open(STATE_FILE, encoding="utf-8"))
             self.active = s.get("active", "none"); self.harm = s.get("harm")
+            self.last_signal_key = s.get("last_signal_key")
             self.last_4h = pd.to_datetime(s["last_4h"]) if s.get("last_4h") else None
             self.last_1h = pd.to_datetime(s["last_1h"]) if s.get("last_1h") else None
             tp = s.get("trend")

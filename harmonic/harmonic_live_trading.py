@@ -25,7 +25,11 @@ import json
 import os
 import sys
 import time
+import warnings
 from datetime import timedelta
+
+# 靜音 requests 對 urllib3/chardet 版本的無害相容性警告（不影響運作）
+warnings.filterwarnings("ignore", message=".*doesn't match a supported version.*")
 
 import ccxt
 import pandas as pd
