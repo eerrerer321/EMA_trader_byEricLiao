@@ -1,0 +1,6 @@
+data/*.csv
+results/
+logs/
+*state.json
+__pycache__/
+*.py[cod]
