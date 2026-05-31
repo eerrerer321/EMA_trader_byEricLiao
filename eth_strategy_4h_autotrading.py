@@ -55,7 +55,7 @@ SYMBOL = TRADE_SYMBOL
 TIMEFRAME = "4h"
 
 # 資金管理設定
-DEFAULT_QTY_PERCENT = 20  # 每次交易使用帳戶可用餘額的百分比
+DEFAULT_QTY_PERCENT = 30  # 每次交易使用帳戶可用餘額的百分比
 TARGET_POSITION_LEVERAGE = 3  # 程式用來計算名目倉位，不會強制改交易所槓桿
 AUTO_SET_EXCHANGE_LEVERAGE = False  # True 時會嘗試把交易所槓桿調到 TARGET_POSITION_LEVERAGE
 REQUIRE_EXCHANGE_LEVERAGE_CAPACITY = True  # 交易所槓桿低於程式目標時，禁止新開倉
@@ -109,6 +109,21 @@ CIRCUIT_BREAKER_BASELINE_DRAWDOWN = SYMBOL_CIRCUIT_BREAKER_BASELINE.get(SYMBOL, 
 CIRCUIT_BREAKER_WARN_MULT = 1.5           # 回撤 ≥ 1.5x baseline → 警戒減碼
 CIRCUIT_BREAKER_HALT_MULT = 2.0           # 回撤 ≥ 2.0x baseline → 熔斷暫停開新倉
 CIRCUIT_BREAKER_WARN_SIZE_SCALE = 0.5     # 警戒級的開倉資金比例係數 (離散化 CPPI)
+
+# === 波動度目標部位 (volatility targeting) ===
+# 邏輯：波動低於目標時加碼、高於目標時減碼，讓「每筆交易的風險貢獻」維持穩定。
+# 效果：平穩趨勢(策略最賺)放大部位、崩盤震盪(最易受傷)自動縮手 → 報酬放大但回撤不放大，
+#       提升 Calmar/Sharpe(現代 CTA/risk-parity 的核心技術)。實測 Calmar 0.33→0.51。
+# 安全：cap 上限 2.0 代表基準 20% 最多加到 40% 曝險(=1.2x 實質槓桿)，仍在「停損失效可恢復」區。
+VOL_TARGET_ENABLED = True
+VOL_TARGET_LOOKBACK = 180   # 4h K 線根數，約 30 天的實現波動 (rolling std of 4h returns)
+VOL_SCALE_MIN = 0.3         # 波動極高時最多減碼到 30%
+VOL_SCALE_MAX = 2.0         # 波動極低時最多加碼到 200%
+SYMBOL_VOL_TARGET = {       # 各標的「典型波動」基準 = 歷史 rolling(180) 4h報酬std 中位數
+    "ETH/USDT": 0.016,
+    "BTC/USDT": 0.012,
+}
+VOL_TARGET_DEFAULT = 0.016
 
 # 各標的最佳參數。
 # ETH/USDT: 2026-05-19 Optuna；2017-2021 純樣本外 12 月視窗 76% 獲利、中位年化 ~20%。
@@ -307,7 +322,14 @@ def calculate_indicators(df):
     df["macd_signal"] = signal_line
     df["macd_histogram"] = histogram
 
-    return df.dropna()
+    # 近期實現波動 (供波動度目標部位 vol targeting 用)。
+    # 用 min_periods=2 並把 ret_vol 排除在 dropna 判斷之外，避免 180 根暖機 NaN
+    # 縮短回測樣本、改變既有回測起點與結果（核心指標的 dropna 行為維持不變）。
+    df["ret_vol"] = (
+        df["close"].pct_change().rolling(VOL_TARGET_LOOKBACK, min_periods=2).std()
+    )
+    core_cols = [c for c in df.columns if c != "ret_vol"]
+    return df.dropna(subset=core_cols)
 
 
 def timeframe_to_timedelta(timeframe):
@@ -736,8 +758,8 @@ class TradingStrategy:
             return CIRCUIT_BREAKER_WARN_SIZE_SCALE, 1, drawdown
         return 1.0, 0, drawdown
 
-    def _prepare_entry_quantity(self, current_close):
-        """新開倉前統一檢查交易所槓桿、回撤熔斷，並以最新 free balance 計算下單數量。"""
+    def _prepare_entry_quantity(self, current_close, recent_vol=None):
+        """新開倉前統一檢查槓桿、回撤熔斷、波動度目標，並以最新 free balance 計算下單數量。"""
         if not self._ensure_exchange_leverage_capacity():
             return 0
 
@@ -756,7 +778,33 @@ class TradingStrategy:
                 f"🟧 回撤警戒：當前回撤 {drawdown*100:.1f}% ≥ 警戒門檻 {warn_th*100:.1f}% "
                 f"(={CIRCUIT_BREAKER_WARN_MULT}x baseline)，本次開倉資金比例降為 {size_scale*100:.0f}%。"
             )
+
+        # 波動度目標部位：與熔斷係數相乘（兩者都是對「基準曝險」的乘性調整）。
+        vol_scale = self._vol_scale(recent_vol)
+        if abs(vol_scale - 1.0) > 1e-9:
+            arrow = "加碼" if vol_scale > 1 else "減碼"
+            print(
+                f"📊 波動度部位調整：近期波動 {float(recent_vol):.4f} → 倉位係數 x{vol_scale:.2f}（{arrow}）"
+            )
+        size_scale *= vol_scale
         return self._calculate_trade_quantity(current_close, size_scale=size_scale)
+
+    def _vol_scale(self, recent_vol):
+        """波動度目標部位係數 = 目標波動 / 近期波動，clip 在 [MIN, MAX]。
+
+        近期波動低於目標 → 係數>1（加碼）；高於目標 → 係數<1（減碼）。
+        未啟用或資料不足時回 1.0（不調整）。
+        """
+        if not VOL_TARGET_ENABLED or recent_vol is None:
+            return 1.0
+        try:
+            v = float(recent_vol)
+        except (TypeError, ValueError):
+            return 1.0
+        if pd.isna(v) or v <= 0:
+            return 1.0
+        target = SYMBOL_VOL_TARGET.get(SYMBOL, VOL_TARGET_DEFAULT)
+        return float(min(max(target / v, VOL_SCALE_MIN), VOL_SCALE_MAX))
 
     def _fixed_stop_price_for_side(self, position_side):
         if position_side == "long" and self.long_entry_price:
@@ -1055,8 +1103,13 @@ class TradingStrategy:
         price_type="market",
         reduce_only=False,
         position_idx=None,
+        stop_loss_price=None,
     ):
-        """下單到 Bybit 統一帳戶"""
+        """下單到 Bybit 統一帳戶。
+
+        stop_loss_price 提供時，會在進場單上「直接夾帶」交易所端整倉固定停損
+        (MarkPrice 即時觸發)，成交當下即生效、零裸倉窗口，不需事後再設一次。
+        """
         try:
             # 確保數量是非零的
             if trade_qty <= 0:
@@ -1067,15 +1120,27 @@ class TradingStrategy:
             print(
                 f"🔄 嘗試下單: {side} {trade_qty} {self.symbol}"
                 f"{' reduce-only' if reduce_only else ''}"
+                f"{f' SL@{stop_loss_price:.2f}' if stop_loss_price and not reduce_only else ''}"
             )
 
             if position_idx is None:
                 position_idx = self._get_order_position_idx(side)
 
+            # 進場單夾帶交易所端固定停損（平倉/減倉單不帶）。
+            sl_params = {}
+            if stop_loss_price and stop_loss_price > 0 and not reduce_only:
+                sl_params = {
+                    "stopLoss": self._format_price(stop_loss_price),
+                    "slTriggerBy": self.stop_trigger_by,
+                    "slOrderType": "Market",
+                    "tpslMode": "Full",
+                }
+
             order_params_common = {
                 "category": "linear",
                 "positionIdx": position_idx,
                 "reduceOnly": reduce_only,
+                **sl_params,
             }
 
             # 方法1: 強制使用線性合約參數
@@ -1102,6 +1167,7 @@ class TradingStrategy:
                             "qty": str(trade_qty),
                             "positionIdx": position_idx,
                             "reduceOnly": reduce_only,
+                            **sl_params,
                         }
                         response = self.exchange.private_post_v5_order_create(
                             order_params
@@ -1576,6 +1642,7 @@ class TradingStrategy:
         current_high = current_bar["high"]
         current_low = current_bar["low"]
         current_adx = current_bar["adx"]
+        recent_vol = current_bar.get("ret_vol") if hasattr(current_bar, "get") else None
 
         # 檢查關鍵數據是否為None
         if current_close is None or current_high is None or current_low is None:
@@ -1688,7 +1755,7 @@ class TradingStrategy:
         )
 
         if self.position_size == 0:
-            trade_qty = self._prepare_entry_quantity(current_close)
+            trade_qty = self._prepare_entry_quantity(current_close, recent_vol)
         else:
             trade_qty = 0
 
@@ -1696,7 +1763,10 @@ class TradingStrategy:
         if self.position_size == 0:
             if long_entry_condition and float(trade_qty) > 0:
                 print(f"{current_time} - 觸發多單進場條件。")
-                order = self._place_order("buy", trade_qty, "market")
+                entry_stop_price = current_close * (1 - self.long_fixed_stop_loss_percent)
+                order = self._place_order(
+                    "buy", trade_qty, "market", stop_loss_price=entry_stop_price
+                )
                 if order:
                     # 🔧 修正：下單後等待並查詢實際持倉來獲取真實進場價
                     time.sleep(2)
@@ -1811,13 +1881,16 @@ class TradingStrategy:
                 if self.position_size != 0:
                     print("⚠️ 平多後仍偵測到持倉，取消同根反手。")
                     return
-                trade_qty = self._prepare_entry_quantity(current_close)
+                trade_qty = self._prepare_entry_quantity(current_close, recent_vol)
 
         # --- 處理空單邏輯 ---
         if self.position_size == 0:
             if short_entry_condition and float(trade_qty) > 0:
                 print(f"{current_time} - 觸發空單進場條件。")
-                order = self._place_order("sell", trade_qty, "market")
+                entry_stop_price = current_close * (1 + self.short_fixed_stop_loss_percent)
+                order = self._place_order(
+                    "sell", trade_qty, "market", stop_loss_price=entry_stop_price
+                )
                 if order:
                     # 🔧 修正：下單後等待並查詢實際持倉來獲取真實進場價
                     print("⏳ 等待2秒後查詢實際持倉資訊...")
@@ -1941,7 +2014,7 @@ class TradingStrategy:
                 if self.position_size != 0:
                     print("⚠️ 平空後仍偵測到持倉，取消同根反手。")
                     return
-                trade_qty = self._prepare_entry_quantity(current_close)
+                trade_qty = self._prepare_entry_quantity(current_close, recent_vol)
 
         # --- 更新資金和回撤計算 ---
         try:

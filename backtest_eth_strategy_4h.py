@@ -25,13 +25,49 @@ import pandas as pd
 
 from eth_strategy_4h_autotrading import (
     ALLOW_SAME_BAR_REVERSAL,
+    CIRCUIT_BREAKER_BASELINE_DRAWDOWN,
+    CIRCUIT_BREAKER_ENABLED,
+    CIRCUIT_BREAKER_HALT_MULT,
+    CIRCUIT_BREAKER_WARN_MULT,
+    CIRCUIT_BREAKER_WARN_SIZE_SCALE,
     DEFAULT_QTY_PERCENT,
     STRATEGY_PARAMS,
     SYMBOL,
+    SYMBOL_VOL_TARGET,
     TARGET_POSITION_LEVERAGE,
     TIMEFRAME,
+    TRADE_SIDE_MODE,
+    VOL_SCALE_MAX,
+    VOL_SCALE_MIN,
+    VOL_TARGET_DEFAULT,
+    VOL_TARGET_ENABLED,
+    VOL_TARGET_LOOKBACK,
     calculate_indicators,
 )
+
+
+def live_vol_target() -> "dict[str, float] | None":
+    """實盤實際使用的 vol-targeting 設定（供回測一鍵重現實盤行為）。"""
+    if not VOL_TARGET_ENABLED:
+        return None
+    return {
+        "target": SYMBOL_VOL_TARGET.get(SYMBOL, VOL_TARGET_DEFAULT),
+        "lookback": VOL_TARGET_LOOKBACK,
+        "scale_min": VOL_SCALE_MIN,
+        "scale_max": VOL_SCALE_MAX,
+    }
+
+
+def live_circuit_breaker() -> "dict[str, float] | None":
+    """實盤實際使用的回撤熔斷設定（供回測一鍵重現實盤行為）。"""
+    if not CIRCUIT_BREAKER_ENABLED:
+        return None
+    return {
+        "baseline_drawdown": CIRCUIT_BREAKER_BASELINE_DRAWDOWN,
+        "warn_mult": CIRCUIT_BREAKER_WARN_MULT,
+        "halt_mult": CIRCUIT_BREAKER_HALT_MULT,
+        "warn_size_scale": CIRCUIT_BREAKER_WARN_SIZE_SCALE,
+    }
 
 
 DEFAULT_INITIAL_CAPITAL = 1000.0
@@ -239,6 +275,23 @@ def circuit_breaker_scale(drawdown: float, cb: dict[str, float] | None) -> float
     return 1.0
 
 
+def vol_target_scale(recent_vol: float | None, vt: dict[str, float] | None) -> float:
+    """Volatility-targeting size scale, mirroring the live engine's _vol_scale:
+    target_vol / recent_vol, clipped to [scale_min, scale_max]. vt=None disables.
+    """
+    if not vt or recent_vol is None:
+        return 1.0
+    try:
+        v = float(recent_vol)
+    except (TypeError, ValueError):
+        return 1.0
+    if math.isnan(v) or v <= 0:
+        return 1.0
+    return float(
+        min(max(vt["target"] / v, vt.get("scale_min", 0.3)), vt.get("scale_max", 2.0))
+    )
+
+
 def open_position(
     side: str,
     entry_time: pd.Timestamp,
@@ -412,12 +465,21 @@ def run_backtest(
     allow_short: bool = True,
     allow_same_bar_reversal: bool = ALLOW_SAME_BAR_REVERSAL,
     circuit_breaker: dict[str, float] | None = None,
+    vol_target: dict[str, float] | None = None,
 ) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
     required_indicator_columns = {"ema90", "ema200", "adx", "rsi"}
     if required_indicator_columns.issubset(raw_df.columns):
         df = raw_df
     else:
         df = calculate_indicators(raw_df.copy())
+    if vol_target is not None and "ret_vol" not in df.columns:
+        df = df.copy()
+        df["ret_vol"] = (
+            df["close"]
+            .pct_change()
+            .rolling(int(vol_target.get("lookback", 180)), min_periods=2)
+            .std()
+        )
     if len(df) < 3:
         raise ValueError("Not enough indicator-ready candles for backtest")
 
@@ -478,8 +540,13 @@ def run_backtest(
             cb_drawdown = (
                 (equity_peak - equity) / equity_peak if equity_peak > 0 else 0.0
             )
-            entry_qty_percent = qty_percent * circuit_breaker_scale(
-                cb_drawdown, circuit_breaker
+            vol_s = vol_target_scale(
+                signal_bar.get("ret_vol") if vol_target else None, vol_target
+            )
+            entry_qty_percent = (
+                qty_percent
+                * circuit_breaker_scale(cb_drawdown, circuit_breaker)
+                * vol_s
             )
             if entry_qty_percent > 0 and signal_long and allow_long:
                 position = open_position(
@@ -595,6 +662,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--slippage-rate", type=float, default=DEFAULT_SLIPPAGE_RATE)
     parser.add_argument("--out-dir", default="backtest_results")
     parser.add_argument("--save-data", action="store_true", help="Save downloaded OHLCV")
+    parser.add_argument(
+        "--no-vol-target",
+        action="store_true",
+        help="關閉波動度目標部位（預設跟隨實盤 VOL_TARGET_ENABLED 設定）",
+    )
+    parser.add_argument(
+        "--no-circuit-breaker",
+        action="store_true",
+        help="關閉回撤熔斷（預設跟隨實盤 CIRCUIT_BREAKER_ENABLED 設定）",
+    )
     return parser
 
 
@@ -619,6 +696,10 @@ def main() -> None:
         fee_rate=args.fee_rate,
         slippage_rate=args.slippage_rate,
         params=STRATEGY_PARAMS.copy(),
+        allow_long=TRADE_SIDE_MODE != "short_only",
+        allow_short=TRADE_SIDE_MODE != "long_only",
+        circuit_breaker=None if args.no_circuit_breaker else live_circuit_breaker(),
+        vol_target=None if args.no_vol_target else live_vol_target(),
     )
 
     print_summary(summary)
