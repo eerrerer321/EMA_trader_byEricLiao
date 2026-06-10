@@ -33,17 +33,27 @@ from backtest_eth_strategy_4h import (  # noqa: E402
     run_backtest, load_ohlcv_csv, long_signal, short_signal,
     check_stop_exit, update_trailing_stop, open_position as bt_open,
     close_position as bt_close, calc_unrealized,
+    vol_target_scale, circuit_breaker_scale, live_vol_target, live_circuit_breaker,
 )
 
 
-def mixed_backtest(df, opps, initial=1000.0, params=None):
-    """趨勢優先、諧波填補空倉的單一資金池回測。回傳 equity DataFrame。"""
+def mixed_backtest(df, opps, initial=1000.0, params=None,
+                   circuit_breaker=None, vol_target=None, vol_target_harm=None):
+    """趨勢優先、諧波填補空倉的單一資金池回測。回傳 equity DataFrame。
+
+    circuit_breaker / vol_target 語意與主回測 run_backtest 相同（None=停用）：
+    - circuit_breaker：以混合權益池的 high-water mark 回撤分級縮減/暫停新開倉，
+      兩條腿共用（同一筆資金的風控本來就該看同一個權益池）。
+    - vol_target：趨勢腿的波動度目標倉位係數（用 signal bar 的 ret_vol）。
+    - vol_target_harm：諧波腿的波動度目標（與趨勢分開控制，方便對照實驗）。
+    """
     params = params or dict(STRATEGY_PARAMS)
     opp_by_j = {}
     for op in opps:
         opp_by_j.setdefault(op["j"], op)
     n = len(df)
     equity = initial
+    equity_peak = float(initial)  # 混合權益池 high-water mark（熔斷用）
     pos = ptype = hp = None
     eq_rows = []
     closes = df["close"].values
@@ -67,16 +77,25 @@ def mixed_backtest(df, opps, initial=1000.0, params=None):
                 gross = (fill - hp["entry"]) * hp["qty"] if bull else (hp["entry"] - fill) * hp["qty"]
                 equity += gross - hp["qty"] * fill * FEE
                 hp = pos = ptype = None
-        # 2) 進場（空倉時）：趨勢優先，否則諧波
+        # 2) 進場（空倉時）：趨勢優先，否則諧波（倉位 = 基準 × 熔斷係數 × 波動度係數）
         if pos is None and not reversed_bar:
+            cb_dd = (equity_peak - equity) / equity_peak if equity_peak > 0 else 0.0
+            cb_s = circuit_breaker_scale(cb_dd, circuit_breaker)
             if sl_long:
-                pos = bt_open("long", ts, float(bar["open"]), equity, QTY_PCT, LEV, FEE, SLIP); ptype = "trend"
+                scale = cb_s * vol_target_scale(
+                    sb.get("ret_vol") if vol_target else None, vol_target)
+                if scale > 0:
+                    pos = bt_open("long", ts, float(bar["open"]), equity,
+                                  QTY_PCT * scale, LEV, FEE, SLIP); ptype = "trend"
             elif i in opp_by_j:
-                op = opp_by_j[i]; entry = op["entry"]
-                qty = equity * QTY_PCT / 100 * LEV / entry
-                equity -= qty * entry * FEE
-                hp = {"entry": entry, "sl": op["sl"], "tp": op["tp"], "bull": op["bull"], "qty": qty}
-                ptype = "harm"; pos = "H"
+                scale = cb_s * vol_target_scale(
+                    sb.get("ret_vol") if vol_target_harm else None, vol_target_harm)
+                if scale > 0:
+                    op = opp_by_j[i]; entry = op["entry"]
+                    qty = equity * QTY_PCT * scale / 100 * LEV / entry
+                    equity -= qty * entry * FEE
+                    hp = {"entry": entry, "sl": op["sl"], "tp": op["tp"], "bull": op["bull"], "qty": qty}
+                    ptype = "harm"; pos = "H"
         # 3) 趨勢同根停損檢查（含進場那根）
         if ptype == "trend":
             st = check_stop_exit(pos, bar, params)
@@ -91,6 +110,7 @@ def mixed_backtest(df, opps, initial=1000.0, params=None):
             mk = equity + ((closes[i] - hp["entry"]) if hp["bull"] else (hp["entry"] - closes[i])) * hp["qty"]
         else:
             mk = equity
+        equity_peak = max(equity_peak, mk)
         eq_rows.append({"timestamp": ts, "equity": mk})
     return pd.DataFrame(eq_rows)
 

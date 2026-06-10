@@ -42,6 +42,7 @@ from eth_strategy_4h_autotrading import (  # noqa: E402
 )
 from backtest_eth_strategy_4h import (  # noqa: E402
     Position, update_trailing_stop, check_stop_exit, long_signal, short_signal,
+    vol_target_scale, live_vol_target,
 )
 from harmonic_strategy import find_pivots, match, TP_RATIO, SL_BUFFER, QTY_PCT, LEV  # noqa: E402
 
@@ -60,6 +61,10 @@ POSITION_IDX = 0
 STOP_LOSS_SYNC_RETRIES = 3
 STOP_LOSS_SYNC_RETRY_DELAY_SECONDS = 2
 P = dict(STRATEGY_PARAMS)
+# 趨勢腿波動度目標倉位（與主程式同一組設定）。混合回測實證（Binance 2017-2026 /
+# Bybit 2021-2026）：只加趨勢腿報酬 291%→530% / 99%→182%、Calmar 0.51→0.69 /
+# 0.80→1.10，滾動視窗獲利率不變；諧波腿加了反而讓滾動獲利率 78%→74%，故諧波維持固定倉位。
+VOL_TARGET = live_vol_target()
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mixed_state.json")
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "mixed_trades.csv")
 ACTIVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "mixed_active.csv")
@@ -111,12 +116,15 @@ class MixedLiveTrader:
         except Exception:
             return 0.0
 
-    def _calc_qty(self, price):
+    def _calc_qty(self, price, recent_vol=None):
         free = self._free()
         if DRY_RUN and free < MIN_PLAUSIBLE_EQUITY_USDT:
             print(f"💡 DRY-RUN：可用餘額 {free:.2f} USDT 不足，以模擬資金 {DRY_RUN_SIM_CAPITAL:.0f} USDT 計算倉位。")
             free = DRY_RUN_SIM_CAPITAL
-        notional = free * QTY_PCT / 100 * LEV
+        scale = vol_target_scale(recent_vol, VOL_TARGET)
+        if abs(scale - 1.0) > 1e-9:
+            print(f"📊 [趨勢] 波動度部位調整：近期波動 {float(recent_vol):.4f} → 倉位係數 x{scale:.2f}")
+        notional = free * QTY_PCT / 100 * LEV * scale
         qty = self._fmt_amt(notional / price)
         mn = self.ex.market(self.symbol)["limits"]["amount"]["min"] or 0.001
         return qty if qty >= mn else 0.0
@@ -274,7 +282,8 @@ class MixedLiveTrader:
     # ---------- 趨勢（4h，重用回測邏輯） ----------
     def _open_trend(self, bar):
         entry = float(bar["close"])
-        qty = self._calc_qty(entry)
+        # 與回測一致：用訊號 bar 的 ret_vol 做波動度目標倉位（諧波腿不適用）
+        qty = self._calc_qty(entry, recent_vol=bar.get("ret_vol"))
         if qty <= 0:
             print("資金不足，趨勢進場略過。")
             return
