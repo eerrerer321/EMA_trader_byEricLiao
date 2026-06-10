@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from trade_logger import log_event, write_active, ensure_log_header  # noqa: E402
 from eth_strategy_4h_autotrading import (  # noqa: E402
     calculate_indicators, fetch_bybit_klines, get_latest_completed_bar, timeframe_to_timedelta,
-    STRATEGY_PARAMS,
+    STRATEGY_PARAMS, MIN_PLAUSIBLE_EQUITY_USDT,
 )
 from backtest_eth_strategy_4h import (  # noqa: E402
     Position, update_trailing_stop, check_stop_exit, long_signal, short_signal,
@@ -53,6 +53,8 @@ HARM_TF = os.getenv("HARMONIC_TIMEFRAME", "1h")
 HARM_PIVOT_N = int(os.getenv("HARMONIC_PIVOT_N", "3"))
 HARM_WAIT = 60
 DRY_RUN = os.getenv("HARMONIC_DRY_RUN", "1") != "0"
+# DRY-RUN 模擬資金：帳戶餘額不足時改用此金額計算倉位，否則所有訊號會因 qty=0 被吞掉
+DRY_RUN_SIM_CAPITAL = float(os.getenv("HARMONIC_DRY_CAPITAL", "1000"))
 STOP_TRIGGER_BY = "MarkPrice"
 POSITION_IDX = 0
 STOP_LOSS_SYNC_RETRIES = 3
@@ -110,7 +112,11 @@ class MixedLiveTrader:
             return 0.0
 
     def _calc_qty(self, price):
-        notional = self._free() * QTY_PCT / 100 * LEV
+        free = self._free()
+        if DRY_RUN and free < MIN_PLAUSIBLE_EQUITY_USDT:
+            print(f"💡 DRY-RUN：可用餘額 {free:.2f} USDT 不足，以模擬資金 {DRY_RUN_SIM_CAPITAL:.0f} USDT 計算倉位。")
+            free = DRY_RUN_SIM_CAPITAL
+        notional = free * QTY_PCT / 100 * LEV
         qty = self._fmt_amt(notional / price)
         mn = self.ex.market(self.symbol)["limits"]["amount"]["min"] or 0.001
         return qty if qty >= mn else 0.0
@@ -333,14 +339,20 @@ class MixedLiveTrader:
             entry, sl, tp = lo, hi * (1 + SL_BUFFER), lo - TP_RATIO * (lo - A[2])
             if not (close < lo and tp < entry < sl):
                 return None
+        # dedup key 必須用 C 樞軸的「時間戳」：C[1] 是滾動視窗內的位置索引，
+        # 每根新 K 線都會位移，拿來去重會誤判（同型態重複掛單／不同型態被誤擋）
         return {"entry": entry, "sl": sl, "tp": tp, "bull": bull, "pattern": name,
-                "x_price": X[2], "c_time": str(C[1])}
+                "x_price": X[2], "c_time": str(df.index[C[1]])}
 
     def _place_harm(self, sig, placed_time=None):
         entry = float(self._fmt_px(sig["entry"]))
         qty = self._calc_qty(entry)
         if qty <= 0:
-            return
+            print(f"🚨 [諧波] 偵測到 {sig['pattern']} 訊號，但資金不足最小下單量，略過（訊號不視為已處理）。")
+            log_event(LOG_FILE, strategy="harmonic", timeframe=HARM_TF, action="skip",
+                      side="buy" if sig["bull"] else "sell", pattern=sig["pattern"],
+                      price=entry, reason="insufficient_funds", dry=DRY_RUN)
+            return False
         side = "buy" if sig["bull"] else "sell"
         print(f"🎯 [諧波] {sig['pattern']} {'多' if sig['bull'] else '空'} 掛限價 {side} {qty} @ {entry} "
               f"| SL {sig['sl']:.2f} TP {sig['tp']:.2f}")
@@ -351,6 +363,7 @@ class MixedLiveTrader:
                   pattern=sig["pattern"], price=entry, qty=qty, sl=round(sig["sl"], 2), tp=round(sig["tp"], 2),
                   dry=DRY_RUN, order_id=order.get("id", ""))
         self.save_state()
+        return True
 
     def _cancel_harm(self, reason):
         if not self.harm:
@@ -455,8 +468,9 @@ class MixedLiveTrader:
         elif self.active == "none":
             sig = self._detect_harm(df)
             if sig and sig["c_time"] != self.last_signal_key:
-                self.last_signal_key = sig["c_time"]
-                self._place_harm(sig, bar.name)
+                # 只有真的掛出單才消耗 dedup key，否則訊號會被無聲吞掉
+                if self._place_harm(sig, bar.name):
+                    self.last_signal_key = sig["c_time"]
 
     # ---------- 狀態 ----------
     def save_state(self):
@@ -537,13 +551,14 @@ class MixedLiveTrader:
                     self._sync_with_exchange("每小時同步")
                     last_sync = time.time()
                 if time.time() - last >= 60:
-                    df4 = calculate_indicators(fetch_bybit_klines(SYMBOL, TREND_TF, limit=300))
+                    # limit=1000：300/500 根視窗的 EMA200 暖機殘差會產生回測沒有的幽靈訊號
+                    df4 = calculate_indicators(fetch_bybit_klines(SYMBOL, TREND_TF, limit=1000))
                     b4 = get_latest_completed_bar(df4, TREND_TF)
                     if b4 is not None and (self.last_4h is None or b4.name > self.last_4h):
                         print(f"\n🔔 新 4h K 線 {b4.name} | 價 {b4['close']:.2f} EMA200 {b4['ema200']:.2f} | 狀態 {self.active}")
                         self.last_4h = b4.name; self.on_4h(b4); self.save_state()
 
-                    df1 = calculate_indicators(fetch_bybit_klines(SYMBOL, HARM_TF, limit=500))
+                    df1 = calculate_indicators(fetch_bybit_klines(SYMBOL, HARM_TF, limit=1000))
                     b1 = get_latest_completed_bar(df1, HARM_TF)
                     if b1 is not None and (self.last_1h is None or b1.name > self.last_1h):
                         self.last_1h = b1.name; self.on_1h(b1, df1); self.save_state()

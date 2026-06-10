@@ -155,7 +155,10 @@ STRATEGY_PARAMS = dict(SYMBOL_STRATEGY_PARAMS[SYMBOL])
 
 # 系統設定
 TRADE_SLEEP_SECONDS = 60  # 每隔多久檢查一次新K線 (60秒檢查一次)
-FETCH_KLINE_LIMIT = 300  # 獲取多少根K線用於指標計算 (確保涵蓋EMA200所需的數據量)
+# 抓取 K 線數量：EMA 是遞迴指標，視窗太短會殘留初始化偏差。
+# 實測 (2025-01~2026-06, 3154 根 4h)：300 根時 EMA200 與全歷史值中位差 0.40%、最大 2.33%，
+# 造成 5 個回測不存在的幽靈進場訊號；1000 根時偏差 <0.002%、訊號 100% 一致。
+FETCH_KLINE_LIMIT = 1000
 
 # 定義保存狀態的檔案路徑（用腳本所在目錄，避免 cron/systemd 等不同 cwd 啟動時寫到錯地方）
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "strategy_state.json")

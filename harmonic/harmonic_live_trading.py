@@ -39,6 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from trade_logger import log_event  # noqa: E402
 from eth_strategy_4h_autotrading import (  # noqa: E402  複用已驗證的指標與 K 線抓取
     calculate_indicators, fetch_bybit_klines, get_latest_completed_bar, timeframe_to_timedelta,
+    MIN_PLAUSIBLE_EQUITY_USDT,
 )
 from harmonic_strategy import (  # noqa: E402  複用偵測核心
     find_pivots, match, PIVOT_N, WAIT, TP_RATIO, SL_BUFFER, QTY_PCT, LEV,
@@ -53,6 +54,8 @@ SYMBOL = (os.getenv("HARMONIC_SYMBOL") or os.getenv("TRADE_SYMBOL") or "ETH/USDT
 TIMEFRAME = os.getenv("HARMONIC_TIMEFRAME", "1h")     # 推薦 1h：機會是 4h 的 3.7 倍且 edge 守住
 PIVOT_N_LIVE = int(os.getenv("HARMONIC_PIVOT_N", "3"))  # 樞軸大小（1h≈3, 30m≈8）
 DRY_RUN = os.getenv("HARMONIC_DRY_RUN", "1") != "0"   # 預設只觀察、不下單
+# DRY-RUN 模擬資金：帳戶餘額不足時改用此金額計算倉位，否則所有訊號會因 qty=0 被吞掉
+DRY_RUN_SIM_CAPITAL = float(os.getenv("HARMONIC_DRY_CAPITAL", "1000"))
 STOP_TRIGGER_BY = "MarkPrice"
 POSITION_IDX_ONE_WAY = 0
 TRADE_SLEEP_SECONDS = 60
@@ -128,6 +131,9 @@ class HarmonicTrader:
 
     def _calc_qty(self, entry_price):
         free = self._free_balance()
+        if DRY_RUN and free < MIN_PLAUSIBLE_EQUITY_USDT:
+            print(f"💡 DRY-RUN：可用餘額 {free:.2f} USDT 不足，以模擬資金 {DRY_RUN_SIM_CAPITAL:.0f} USDT 計算倉位。")
+            free = DRY_RUN_SIM_CAPITAL
         notional = free * QTY_PCT / 100 * LEV
         qty = self._format_amount(notional / entry_price)
         market = self.exchange.market(self.symbol)
@@ -164,15 +170,20 @@ class HarmonicTrader:
             entry, sl, tp = prz_lo, prz_hi * (1 + SL_BUFFER), prz_lo - TP_RATIO * (prz_lo - A[2])
             if not (close < prz_lo and tp < entry < sl):
                 return None
+        # dedup key 必須用 C 樞軸的「時間戳」：C[1] 是滾動視窗內的位置索引，
+        # 每根新 K 線都會位移，拿來去重會誤判（同型態重複掛單／不同型態被誤擋）
         return {"entry": entry, "sl": sl, "tp": tp, "bull": bull, "pattern": name,
-                "x_price": X[2], "c_time": str(C[1])}
+                "x_price": X[2], "c_time": str(df.index[C[1]])}
 
     # ---------- 下單（限價 + 交易所端 SL/TP） ----------
     def _place_limit_with_sltp(self, sig):
         entry = float(self._format_price(sig["entry"]))
         qty = self._calc_qty(entry)
         if qty <= 0:
-            print("數量不足最小下單量，略過。")
+            print(f"🚨 偵測到 {sig['pattern']} 訊號，但資金不足最小下單量，略過（訊號不視為已處理）。")
+            log_event(LOG_FILE, strategy="harmonic", timeframe=TIMEFRAME, action="skip",
+                      side="buy" if sig["bull"] else "sell", pattern=sig["pattern"],
+                      price=entry, reason="insufficient_funds", dry=DRY_RUN)
             return False
         side = "buy" if sig["bull"] else "sell"
         params = {
@@ -358,8 +369,9 @@ class HarmonicTrader:
         sig = self._detect_signal(df)
         if not sig or sig["c_time"] == self.last_signal_key:
             return
-        self.last_signal_key = sig["c_time"]
-        self._place_limit_with_sltp(sig)
+        # 只有真的掛出單才消耗 dedup key，否則訊號會被無聲吞掉
+        if self._place_limit_with_sltp(sig):
+            self.last_signal_key = sig["c_time"]
         self.save_state()
 
     def run(self):
@@ -371,7 +383,8 @@ class HarmonicTrader:
                 if not DRY_RUN and now - last_check >= TRADE_SLEEP_SECONDS:
                     self._sync_with_exchange()
                 if now - last_check >= TRADE_SLEEP_SECONDS:
-                    df = calculate_indicators(fetch_bybit_klines(SYMBOL, TIMEFRAME, limit=500))
+                    # limit=1000：500 根視窗的 EMA200 暖機殘差會讓順大勢過濾與回測不一致
+                    df = calculate_indicators(fetch_bybit_klines(SYMBOL, TIMEFRAME, limit=1000))
                     bar = get_latest_completed_bar(df, TIMEFRAME)
                     if bar is not None:
                         if self.last_processed_kline is None or bar.name > self.last_processed_kline:
