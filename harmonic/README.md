@@ -122,6 +122,9 @@ HARMONIC_TIMEFRAME=1h HARMONIC_PIVOT_N=3 HARMONIC_DRY_RUN=0 python harmonic_live
 - **趨勢腿進場帶「多頭擁擠」過濾**：BTC 幣本位 3 日平滑資金費率 > 0.01%/8h 時不開新
   多單（公開端點，讀取失敗自動旁路）。實證：該情境多單 PF 僅 0.81；過濾後 ETH Bybit
   21-26 PF 1.58→1.72、滾動獲利率 69→73%，BTC 18-26 報酬 330%→511%、MDD −32→−27%。
+- **趨勢腿「深負費率加碼」**：BTC 費率 < −0.01%/8h（空方深度擁擠、軋空燃料）時新多單
+  倉位 ×1.5，與波動度係數相乘後 cap 2.0（不放大曝險包絡）。實證：ETH Bybit 182.8%→188.7%、
+  BTC 18-26 511%→637%，三資料集 MDD 完全不變；寬鬆版（<0 就加碼）實測有害已否決。
 
 ```bash
 python run_mixed_live.py                       # DRY-RUN 觀察(預設)，先跑幾天看協調

@@ -125,6 +125,21 @@ SYMBOL_VOL_TARGET = {       # 各標的「典型波動」基準 = 歷史 rolling
 }
 VOL_TARGET_DEFAULT = 0.016
 
+# === 深負費率加碼 (funding boost) ===
+# BTC 幣本位 3 日均資金費率 < -0.01%/8h（空方深度擁擠 = 軋空燃料充足）時，
+# 新開多單倉位 × 1.5；與波動度係數相乘後 cap 在 VOL_SCALE_MAX，不放大已驗證
+# 的曝險包絡。閾值 -0.01% 取自費率假說檢驗的 deep_neg 分桶邊界（該情境 BTC
+# 30 天前瞻 +17.5% vs 無條件 +5.1%），非回測擬合值；寬鬆版（<0 就加碼）實測
+# 反而傷 Sharpe/MDD，已否決。實證（含過熱過濾的基線 → 加上 boost）：
+#   ETH Bybit 21-26: 182.8%→188.7%，ETH Binance 18-26: 281%→298%，
+#   BTC 18-26: 511%→637%；三資料集 MDD 完全不變、PF/Sharpe 持平或升。
+FUNDING_BOOST_ENABLED = True
+FUNDING_BOOST = (
+    {"threshold": -0.0001, "factor": 1.5, "cap": VOL_SCALE_MAX}
+    if FUNDING_BOOST_ENABLED
+    else None
+)
+
 # 各標的最佳參數。
 # ETH/USDT: 2026-05-19 Optuna；2017-2021 純樣本外 12 月視窗 76% 獲利、中位年化 ~20%。
 SYMBOL_STRATEGY_PARAMS = {
@@ -403,6 +418,22 @@ def short_signal(bar, params):
         and bar["adx"] > adx_threshold
         and bar["rsi"] >= 30
     )
+
+
+def apply_funding_boost(base_scale, btc_funding_3d, boost):
+    """深負費率加碼：費率低於 boost["threshold"] 時 base_scale × factor，cap 限制。
+
+    live 與回測共用（單一事實來源）。boost=None 或費率缺失/非數值時原樣返回。
+    """
+    if not boost or btc_funding_3d is None:
+        return base_scale
+    try:
+        f = float(btc_funding_3d)
+    except (TypeError, ValueError):
+        return base_scale
+    if pd.isna(f) or f >= boost.get("threshold", -0.0001):
+        return base_scale
+    return float(min(base_scale * boost.get("factor", 1.5), boost.get("cap", VOL_SCALE_MAX)))
 
 
 def fetch_btc_funding_3d():
@@ -823,8 +854,8 @@ class TradingStrategy:
             return CIRCUIT_BREAKER_WARN_SIZE_SCALE, 1, drawdown
         return 1.0, 0, drawdown
 
-    def _prepare_entry_quantity(self, current_close, recent_vol=None):
-        """新開倉前統一檢查槓桿、回撤熔斷、波動度目標，並以最新 free balance 計算下單數量。"""
+    def _prepare_entry_quantity(self, current_close, recent_vol=None, btc_funding_3d=None):
+        """新開倉前統一檢查槓桿、回撤熔斷、波動度目標與深負費率加碼，並以最新 free balance 計算下單數量。"""
         if not self._ensure_exchange_leverage_capacity():
             return 0
 
@@ -851,7 +882,14 @@ class TradingStrategy:
             print(
                 f"📊 波動度部位調整：近期波動 {float(recent_vol):.4f} → 倉位係數 x{vol_scale:.2f}（{arrow}）"
             )
-        size_scale *= vol_scale
+        # 深負費率加碼：與回測 funding_boost 同一函式（單一事實來源）
+        boosted = apply_funding_boost(vol_scale, btc_funding_3d, FUNDING_BOOST)
+        if abs(boosted - vol_scale) > 1e-9:
+            print(
+                f"🚀 深負費率加碼：BTC 3日均費率 {float(btc_funding_3d)*100:+.4f}%/8h"
+                f" → 倉位係數 x{vol_scale:.2f}→x{boosted:.2f}"
+            )
+        size_scale *= boosted
         return self._calculate_trade_quantity(current_close, size_scale=size_scale)
 
     def _vol_scale(self, recent_vol):
@@ -1695,6 +1733,9 @@ class TradingStrategy:
         current_low = current_bar["low"]
         current_adx = current_bar["adx"]
         recent_vol = current_bar.get("ret_vol") if hasattr(current_bar, "get") else None
+        recent_funding = (
+            current_bar.get("btc_funding_3d") if hasattr(current_bar, "get") else None
+        )
 
         # 檢查關鍵數據是否為None
         if current_close is None or current_high is None or current_low is None:
@@ -1807,7 +1848,7 @@ class TradingStrategy:
         )
 
         if self.position_size == 0:
-            trade_qty = self._prepare_entry_quantity(current_close, recent_vol)
+            trade_qty = self._prepare_entry_quantity(current_close, recent_vol, btc_funding_3d=recent_funding)
         else:
             trade_qty = 0
 
@@ -1933,7 +1974,7 @@ class TradingStrategy:
                 if self.position_size != 0:
                     print("⚠️ 平多後仍偵測到持倉，取消同根反手。")
                     return
-                trade_qty = self._prepare_entry_quantity(current_close, recent_vol)
+                trade_qty = self._prepare_entry_quantity(current_close, recent_vol, btc_funding_3d=recent_funding)
 
         # --- 處理空單邏輯 ---
         if self.position_size == 0:
@@ -2066,7 +2107,7 @@ class TradingStrategy:
                 if self.position_size != 0:
                     print("⚠️ 平空後仍偵測到持倉，取消同根反手。")
                     return
-                trade_qty = self._prepare_entry_quantity(current_close, recent_vol)
+                trade_qty = self._prepare_entry_quantity(current_close, recent_vol, btc_funding_3d=recent_funding)
 
         # --- 更新資金和回撤計算 ---
         try:

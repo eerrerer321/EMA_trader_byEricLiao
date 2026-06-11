@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from trade_logger import log_event, write_active, ensure_log_header  # noqa: E402
 from eth_strategy_4h_autotrading import (  # noqa: E402
     calculate_indicators, fetch_bybit_klines, get_latest_completed_bar, timeframe_to_timedelta,
-    STRATEGY_PARAMS, MIN_PLAUSIBLE_EQUITY_USDT,
+    STRATEGY_PARAMS, MIN_PLAUSIBLE_EQUITY_USDT, FUNDING_BOOST, apply_funding_boost,
 )
 from backtest_eth_strategy_4h import (  # noqa: E402
     Position, update_trailing_stop, check_stop_exit, long_signal, short_signal,
@@ -213,7 +213,7 @@ class MixedLiveTrader:
         print(f"🚨 Bybit 槓桿 {actual}x < 程式名目槓桿 {LEV:.0f}x，本次開倉取消。請調高交易所槓桿或降低 LEV。")
         return False
 
-    def _calc_qty(self, price, recent_vol=None):
+    def _calc_qty(self, price, recent_vol=None, btc_funding_3d=None):
         if not self._ensure_leverage_capacity():
             return 0.0
         free = self._free()
@@ -223,6 +223,11 @@ class MixedLiveTrader:
         scale = vol_target_scale(recent_vol, VOL_TARGET)
         if abs(scale - 1.0) > 1e-9:
             print(f"📊 [趨勢] 波動度部位調整：近期波動 {float(recent_vol):.4f} → 倉位係數 x{scale:.2f}")
+        # 深負費率加碼：與回測/主程式共用 apply_funding_boost（單一事實來源）
+        boosted = apply_funding_boost(scale, btc_funding_3d, FUNDING_BOOST)
+        if abs(boosted - scale) > 1e-9:
+            print(f"🚀 [趨勢] 深負費率加碼：BTC 3日均費率 {float(btc_funding_3d)*100:+.4f}%/8h → 倉位係數 x{scale:.2f}→x{boosted:.2f}")
+            scale = boosted
         notional = free * QTY_PCT / 100 * LEV * scale
         qty = self._fmt_amt(notional / price)
         mn = self.ex.market(self.symbol)["limits"]["amount"]["min"] or 0.001
@@ -381,8 +386,9 @@ class MixedLiveTrader:
     # ---------- 趨勢（4h，重用回測邏輯） ----------
     def _open_trend(self, bar):
         entry = float(bar["close"])
-        # 與回測一致：用訊號 bar 的 ret_vol 做波動度目標倉位（諧波腿不適用）
-        qty = self._calc_qty(entry, recent_vol=bar.get("ret_vol"))
+        # 與回測一致：用訊號 bar 的 ret_vol / btc_funding_3d 做倉位調整（諧波腿不適用）
+        qty = self._calc_qty(entry, recent_vol=bar.get("ret_vol"),
+                             btc_funding_3d=bar.get("btc_funding_3d"))
         if qty <= 0:
             print("資金不足，趨勢進場略過。")
             return

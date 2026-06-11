@@ -42,6 +42,8 @@ from eth_strategy_4h_autotrading import (
     VOL_TARGET_DEFAULT,
     VOL_TARGET_ENABLED,
     VOL_TARGET_LOOKBACK,
+    FUNDING_BOOST,
+    apply_funding_boost,
     calculate_indicators,
     long_signal,
     short_signal,
@@ -58,6 +60,11 @@ def live_vol_target() -> "dict[str, float] | None":
         "scale_min": VOL_SCALE_MIN,
         "scale_max": VOL_SCALE_MAX,
     }
+
+
+def live_funding_boost() -> "dict[str, float] | None":
+    """實盤實際使用的深負費率加碼設定（供回測一鍵重現實盤行為）。"""
+    return dict(FUNDING_BOOST) if FUNDING_BOOST else None
 
 
 def live_circuit_breaker() -> "dict[str, float] | None":
@@ -450,6 +457,7 @@ def run_backtest(
     allow_same_bar_reversal: bool = ALLOW_SAME_BAR_REVERSAL,
     circuit_breaker: dict[str, float] | None = None,
     vol_target: dict[str, float] | None = None,
+    funding_boost: dict[str, float] | None = None,
 ) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
     required_indicator_columns = {"ema90", "ema200", "adx", "rsi"}
     if required_indicator_columns.issubset(raw_df.columns):
@@ -526,6 +534,10 @@ def run_backtest(
             )
             vol_s = vol_target_scale(
                 signal_bar.get("ret_vol") if vol_target else None, vol_target
+            )
+            # 深負費率加碼（與 live 共用 apply_funding_boost；None = 停用，行為不變）
+            vol_s = apply_funding_boost(
+                vol_s, signal_bar.get("btc_funding_3d"), funding_boost
             )
             entry_qty_percent = (
                 qty_percent
