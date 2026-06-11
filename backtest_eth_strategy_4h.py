@@ -169,13 +169,25 @@ def load_ohlcv_csv(path: str) -> pd.DataFrame:
 
 def long_signal(bar: pd.Series, params: dict[str, float]) -> bool:
     adx_threshold = params.get("long_adx_threshold", params["adx_threshold"])
-    return bool(
+    base = bool(
         bar["close"] > bar["ema90"]
         and bar["low"] > bar["ema90"]
         and bar["close"] > bar["ema200"]
         and bar["adx"] > adx_threshold
         and bar["rsi"] <= 70
     )
+    if not base:
+        return False
+    # 選配的「多頭擁擠」過濾：BTC 幣本位 3 日平滑資金費率高於閾值時不開新多單。
+    # 實證（2018-2026 三資料集）：費率 >0.01%/8h 時的多單進場 PF 僅 0.81，過濾後
+    # PF/Sharpe/滾動獲利率全面提升（見 commit 訊息）。params 無此鍵或 bar 無此欄
+    # 位（如 live 未接費率、舊回測資料）時自動旁路，行為與舊版完全相同。
+    max_funding = params.get("max_btc_funding_3d")
+    if max_funding is not None:
+        funding = bar.get("btc_funding_3d")
+        if funding is not None and not pd.isna(funding) and funding > max_funding:
+            return False
+    return True
 
 
 def short_signal(bar: pd.Series, params: dict[str, float]) -> bool:

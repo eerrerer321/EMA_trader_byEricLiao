@@ -140,6 +140,11 @@ SYMBOL_STRATEGY_PARAMS = {
         "short_trailing_activate_profit_percent": 0.004073022320643781,
         "short_trailing_pullback_percent": 0.08106115862332733,
         "short_trailing_min_profit_percent": 0.0014520289476228749,
+        # 多頭擁擠過濾：BTC 幣本位 3 日平滑資金費率 > 0.01%/8h（Bybit 標準費率
+        # 上緣，非擬合值）時不開新多單。實證：該情境的多單 PF 僅 0.81（虧錢），
+        # 過濾後 ETH Bybit 21-26 PF 1.58→1.72、滾動獲利率 69→73%；BTC 18-26
+        # 報酬 330%→511%、MDD -32→-27。訊號bar缺 btc_funding_3d 欄位時自動旁路。
+        "max_btc_funding_3d": 0.0001,
     },
 }
 # BTC/USDT 刻意「沿用」ETH 的 long_only 參數，而非為 BTC 單獨優化。

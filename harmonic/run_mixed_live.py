@@ -119,6 +119,22 @@ class MixedLiveTrader:
         except Exception:
             return 0.0
 
+    def _btc_funding_3d(self):
+        """BTC 幣本位 3 日平滑資金費率（最近 9 筆 8h 均值），供 long_signal 多頭擁擠過濾。
+
+        公開端點、無需 API key；失敗回 None → 過濾自動旁路（fail-open：
+        過濾是錦上添花，不能因行情服務異常而擋住正常交易）。
+        """
+        try:
+            hist = self.ex.fetch_funding_rate_history("BTC/USD:BTC", limit=9)
+            rates = [float(r["fundingRate"]) for r in hist if r.get("fundingRate") is not None]
+            if len(rates) >= 3:
+                return sum(rates) / len(rates)
+            print("⚠️ BTC 資金費率筆數不足，本根 K 線跳過擁擠過濾。")
+        except Exception as e:
+            print(f"⚠️ 讀取 BTC 資金費率失敗（{e}），本根 K 線跳過擁擠過濾。")
+        return None
+
     def _check_position_mode(self):
         """實單啟動前確認帳戶為單向（one-way）持倉。
 
@@ -625,7 +641,10 @@ class MixedLiveTrader:
                     df4 = calculate_indicators(fetch_bybit_klines(SYMBOL, TREND_TF, limit=1000))
                     b4 = get_latest_completed_bar(df4, TREND_TF)
                     if b4 is not None and (self.last_4h is None or b4.name > self.last_4h):
-                        print(f"\n🔔 新 4h K 線 {b4.name} | 價 {b4['close']:.2f} EMA200 {b4['ema200']:.2f} | 狀態 {self.active}")
+                        b4["btc_funding_3d"] = self._btc_funding_3d()  # None 時過濾自動旁路
+                        f_msg = (f" | BTC費率(3d) {b4['btc_funding_3d']*100:+.4f}%"
+                                 if b4["btc_funding_3d"] is not None else "")
+                        print(f"\n🔔 新 4h K 線 {b4.name} | 價 {b4['close']:.2f} EMA200 {b4['ema200']:.2f}{f_msg} | 狀態 {self.active}")
                         self.last_4h = b4.name; self.on_4h(b4); self.save_state()
 
                     df1 = calculate_indicators(fetch_bybit_klines(SYMBOL, HARM_TF, limit=1000))
