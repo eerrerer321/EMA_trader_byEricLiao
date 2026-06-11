@@ -388,7 +388,8 @@ class HarmonicTrader:
                     bar = get_latest_completed_bar(df, TIMEFRAME)
                     if bar is not None:
                         if self.last_processed_kline is None or bar.name > self.last_processed_kline:
-                            print(f"\n🔔 新 4h K 線 {bar.name} | 價格 {bar['close']:.2f} | EMA200 {bar['ema200']:.2f}")
+                            # 顯示轉台灣時間；內部 last_processed_kline 比較維持 UTC
+                            print(f"\n🔔 新 K 線 {pd.Timestamp(bar.name) + pd.Timedelta(hours=8)} (台灣) | 價格 {bar['close']:.2f} | EMA200 {bar['ema200']:.2f}")
                             self.last_processed_kline = bar.name
                             self.process(bar, df)
                             self.save_state()
