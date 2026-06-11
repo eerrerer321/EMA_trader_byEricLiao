@@ -146,10 +146,9 @@ def fetch_ohlcv_from_bybit(
         since = next_since
         if until is not None and since >= until:
             break
-        # Bybit can return 999 candles even when more data is available, so only
-        # use this short-batch break when no explicit end date was requested.
-        if until is None and len(batch) < limit:
-            break
+        # 不可用「短批次」當終止條件：Bybit 在歷史中段也可能回傳少於 limit 的
+        # 批次（實測 until=None 從 2026-01 抓 1h 會在 ~2000 根提前截斷）。
+        # 終止交給「下一批為空」：游標嚴格遞增，追到最新 K 線後下一批必為空。
 
     if not rows:
         raise RuntimeError("No OHLCV data fetched")
