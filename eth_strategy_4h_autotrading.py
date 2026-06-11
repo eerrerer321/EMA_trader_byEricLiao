@@ -367,6 +367,61 @@ def get_latest_completed_bar(df, timeframe):
     return completed.iloc[-1]
 
 
+# --- 2.5 進場訊號（live 與回測共用的單一事實來源） ---
+def long_signal(bar, params):
+    """趨勢多單進場訊號。bar 需含 ema90/ema200/adx/rsi 欄位。
+
+    含選配的「多頭擁擠」過濾：BTC 幣本位 3 日平滑資金費率高於
+    params["max_btc_funding_3d"] 時不開新多單（實證該情境多單 PF 僅 0.81）。
+    params 無此鍵或 bar 無 btc_funding_3d 欄位時自動旁路。
+    """
+    adx_threshold = params.get("long_adx_threshold", params["adx_threshold"])
+    base = bool(
+        bar["close"] > bar["ema90"]
+        and bar["low"] > bar["ema90"]
+        and bar["close"] > bar["ema200"]
+        and bar["adx"] > adx_threshold
+        and bar["rsi"] <= 70
+    )
+    if not base:
+        return False
+    max_funding = params.get("max_btc_funding_3d")
+    if max_funding is not None:
+        funding = bar.get("btc_funding_3d")
+        if funding is not None and not pd.isna(funding) and funding > max_funding:
+            return False
+    return True
+
+
+def short_signal(bar, params):
+    """趨勢空單進場訊號。bar 需含 ema90/ema200/adx/rsi 欄位。"""
+    adx_threshold = params.get("short_adx_threshold", params["adx_threshold"])
+    return bool(
+        bar["close"] < bar["ema90"]
+        and bar["high"] < bar["ema90"]
+        and bar["close"] < bar["ema200"]
+        and bar["adx"] > adx_threshold
+        and bar["rsi"] >= 30
+    )
+
+
+def fetch_btc_funding_3d():
+    """BTC 幣本位 3 日平滑資金費率（最近 9 筆 8h 均值），供 long_signal 擁擠過濾。
+
+    公開端點、無需 API key；失敗回 None → 過濾自動旁路（fail-open）。
+    """
+    try:
+        exchange = _get_public_exchange()
+        hist = exchange.fetch_funding_rate_history("BTC/USD:BTC", limit=9)
+        rates = [float(r["fundingRate"]) for r in hist if r.get("fundingRate") is not None]
+        if len(rates) >= 3:
+            return sum(rates) / len(rates)
+        print("⚠️ BTC 資金費率筆數不足，本根 K 線跳過擁擠過濾。")
+    except Exception as e:
+        print(f"⚠️ 讀取 BTC 資金費率失敗（{e}），本根 K 線跳過擁擠過濾。")
+    return None
+
+
 # --- 3. 交易邏輯實現 ---
 class TradingStrategy:
     def __init__(self, custom_params=None):
@@ -378,6 +433,8 @@ class TradingStrategy:
         params = STRATEGY_PARAMS.copy()
         if custom_params:
             params.update(custom_params)
+        # 進場訊號用的完整參數（含 max_btc_funding_3d），與回測 long/short_signal 共用
+        self.entry_params = dict(params)
 
         # 資金管理設定
         self.default_qty_percent = DEFAULT_QTY_PERCENT
@@ -1616,27 +1673,14 @@ class TradingStrategy:
                 return False
 
     def _compute_entry_signals(self, current_bar):
-        """集中計算原始多空訊號與 side-mode 過濾後的新開倉訊號。"""
-        current_close = current_bar["close"]
-        current_high = current_bar["high"]
-        current_low = current_bar["low"]
-        current_adx = current_bar["adx"]
-        current_rsi = current_bar["rsi"]
+        """集中計算原始多空訊號與 side-mode 過濾後的新開倉訊號。
 
-        raw_long = (
-            current_close > current_bar["ema90"]
-            and current_low > current_bar["ema90"]
-            and current_close > current_bar["ema200"]
-            and current_adx > self.long_adx_threshold
-            and current_rsi <= 70
-        )
-        raw_short = (
-            current_close < current_bar["ema90"]
-            and current_high < current_bar["ema90"]
-            and current_close < current_bar["ema200"]
-            and current_adx > self.short_adx_threshold
-            and current_rsi >= 30
-        )
+        直接委派給模組層 long_signal / short_signal（與回測同一組函式，
+        單一事實來源），確保含資金費率擁擠過濾在內的進場語意
+        live / 回測 / 混合實盤完全一致。
+        """
+        raw_long = long_signal(current_bar, self.entry_params)
+        raw_short = short_signal(current_bar, self.entry_params)
         return {
             "raw_long": bool(raw_long),
             "raw_short": bool(raw_short),
@@ -2445,6 +2489,11 @@ def run_live_trading():
                     kline_taipei_time = current_bar.name + timedelta(hours=8)
                     print(f"\n\n🔔 檢測到新 4小時 K 線: {kline_taipei_time}")
                     print(f"⏰ 開始技術分析和交易判斷...")
+
+                    # 注入 BTC 資金費率（None 時 long_signal 擁擠過濾自動旁路）
+                    current_bar["btc_funding_3d"] = fetch_btc_funding_3d()
+                    if current_bar["btc_funding_3d"] is not None:
+                        print(f"💸 BTC 資金費率(3日均): {current_bar['btc_funding_3d']*100:+.4f}%/8h")
 
                     # 將最新完成的 K 線傳入策略進行處理
                     strategy.process_bar(current_bar)
