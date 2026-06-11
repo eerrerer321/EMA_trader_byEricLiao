@@ -90,6 +90,9 @@ class MixedLiveTrader:
         self.last_4h = None
         self.last_1h = None
         self.load_state()
+        if not self._check_position_mode():
+            raise SystemExit("持倉模式不符，已中止啟動。")
+        self._ensure_leverage_capacity()  # 啟動先驗一次（失敗只警告；每次開倉前還會再擋）
         self._sync_with_exchange("啟動同步")
         ensure_log_header(LOG_FILE)  # 啟動即建立交易事件日誌（空表頭，待第一筆交易填入）
         self._write_active()  # 啟動即寫一次當前活躍快照（即使無持倉也立刻產生檔案）
@@ -116,7 +119,65 @@ class MixedLiveTrader:
         except Exception:
             return 0.0
 
+    def _check_position_mode(self):
+        """實單啟動前確認帳戶為單向（one-way）持倉。
+
+        本程式所有下單寫死 positionIdx=0，hedge mode 下會被 Bybit 拒單；
+        與其在第一筆訊號時才爆炸，不如啟動就擋下（對齊主程式的模式偵測）。
+        """
+        if DRY_RUN:
+            return True
+        try:
+            if hasattr(self.ex, "fetch_position_mode"):
+                mode = self.ex.fetch_position_mode(self.symbol, {"category": "linear"})
+                if mode.get("hedged"):
+                    print("🚨 Bybit 帳戶為對沖(hedge)持倉模式，本程式僅支援單向(one-way)：請先在 Bybit 切換後再啟動。")
+                    return False
+        except Exception as e:
+            print(f"⚠️ 無法確認持倉模式（{e}），請自行確認 Bybit 為單向(one-way)模式。")
+        return True
+
+    def _exchange_leverage(self):
+        """讀取交易所目前槓桿（對齊主程式 _get_exchange_leverage）；讀不到回 None。"""
+        try:
+            if hasattr(self.ex, "fetch_leverage"):
+                info = self.ex.fetch_leverage(self.symbol, {"category": "linear"})
+                vals = [float(v) for v in (info.get("longLeverage"), info.get("shortLeverage"))
+                        if v not in (None, "", 0, "0")]
+                if vals:
+                    return min(vals)
+        except Exception:
+            pass
+        try:
+            for pos in self.ex.private_get_v5_position_list(
+                    {"category": "linear", "symbol": self.bybit_symbol}).get("result", {}).get("list", []):
+                lv = pos.get("leverage")
+                if lv not in (None, "", "0", 0):
+                    return float(lv)
+        except Exception:
+            pass
+        return None
+
+    def _ensure_leverage_capacity(self):
+        """實單開倉前確認交易所槓桿 >= 程式名目槓桿 LEV，不足則取消本次開倉。
+
+        vol targeting 係數上限 2.0 時名目曝險最高 = QTY_PCT×LEV×2 ≈ 1.2x 權益，
+        交易所槓桿不足會導致保證金不足拒單或部分成交（對齊主程式的容量檢查）。
+        """
+        if DRY_RUN:
+            return True
+        actual = self._exchange_leverage()
+        if actual is None:
+            print(f"⚠️ 無法讀取交易所槓桿，仍會下單；請自行確認 Bybit 槓桿 >= {LEV:.0f}x。")
+            return True
+        if actual >= LEV:
+            return True
+        print(f"🚨 Bybit 槓桿 {actual}x < 程式名目槓桿 {LEV:.0f}x，本次開倉取消。請調高交易所槓桿或降低 LEV。")
+        return False
+
     def _calc_qty(self, price, recent_vol=None):
+        if not self._ensure_leverage_capacity():
+            return 0.0
         free = self._free()
         if DRY_RUN and free < MIN_PLAUSIBLE_EQUITY_USDT:
             print(f"💡 DRY-RUN：可用餘額 {free:.2f} USDT 不足，以模擬資金 {DRY_RUN_SIM_CAPITAL:.0f} USDT 計算倉位。")
