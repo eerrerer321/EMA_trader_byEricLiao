@@ -65,6 +65,20 @@ P = dict(STRATEGY_PARAMS)
 # Bybit 2021-2026）：只加趨勢腿報酬 291%→530% / 99%→182%、Calmar 0.51→0.69 /
 # 0.80→1.10，滾動視窗獲利率不變；諧波腿加了反而讓滾動獲利率 78%→74%，故諧波維持固定倉位。
 VOL_TARGET = live_vol_target()
+
+# === 深負費率「抄底腿」（使用者 2026-06-12 核准半倉版） ===
+# 進場：3 日均 BTC 幣本位費率「由上往下穿越」-0.01%/8h（深負=空方深度擁擠=軋空燃料；
+#       同一輪深負期間只進一次，需先回到閾值上方重新武裝）。
+# 出場：30 天（180 根 4h）時間出場。刻意無停損——回測四變體實證 -10% 災難停損
+#       全面有害（會精準砍在擠壓前最低點）。
+# 倉位：半倉 10%×3 × 波動度係數（不吃費率加碼）。三腿協調回測（ETH Bybit 21-26）：
+#       風險包絡與現行完全相同（MDD/worst/wMDD 一字不差），滾動獲利率 73.1→76.9%；
+#       長歷史（Binance 18-26）350%→473%、獲利率 74.4→83.7%、wMDD 不變。
+# 風險：設計上在恐慌中接刀，2021-11~2022-06 瀑布段該腿 PF 僅 0.40，靠其後 PF 10+ 補回。
+DIP_ENABLED = os.getenv("HARMONIC_DIP_ENABLED", "1") != "0"
+DIP_QTY_PCT = QTY_PCT / 2          # 半倉
+DIP_FUNDING_THRESHOLD = -0.0001    # 與費率假說 deep_neg 分桶邊界一致（非擬合值）
+DIP_HOLD_BARS = 180                # 30 天的 4h 根數
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mixed_state.json")
 
 
@@ -74,6 +88,7 @@ ACTIVE_LABELS = {
     "trend": "趨勢持倉中",
     "harm_pending": "諧波掛單等待成交",
     "harm_pos": "諧波持倉中",
+    "dip_pos": "抄底持倉中(30天時間出場)",
     "external_pos": "外部持倉(暫停新訊號)",
 }
 
@@ -105,9 +120,11 @@ class MixedLiveTrader:
         self.ex.load_markets()
         self.symbol = SYMBOL
         self.bybit_symbol = self.ex.market(self.symbol).get("id", SYMBOL.replace("/", ""))
-        self.active = "none"        # none / trend / harm_pending / harm_pos / external_pos
+        self.active = "none"        # none / trend / harm_pending / harm_pos / dip_pos / external_pos
         self.trend = None           # backtest Position
         self.harm = None            # dict
+        self.dip = None             # dict {entry, qty, entry_time}（深負費率抄底腿）
+        self.dip_armed = True       # fresh-crossing 武裝狀態（費率回到閾值上方才重新武裝）
         self.last_signal_key = None  # 已處理過的諧波 C 樞軸，避免對同型態重複掛單
         self.last_4h = None
         self.last_1h = None
@@ -213,7 +230,7 @@ class MixedLiveTrader:
         print(f"🚨 Bybit 槓桿 {actual}x < 程式名目槓桿 {LEV:.0f}x，本次開倉取消。請調高交易所槓桿或降低 LEV。")
         return False
 
-    def _calc_qty(self, price, recent_vol=None, btc_funding_3d=None):
+    def _calc_qty(self, price, recent_vol=None, btc_funding_3d=None, qty_pct=QTY_PCT):
         if not self._ensure_leverage_capacity():
             return 0.0
         free = self._free()
@@ -222,13 +239,13 @@ class MixedLiveTrader:
             free = DRY_RUN_SIM_CAPITAL
         scale = vol_target_scale(recent_vol, VOL_TARGET)
         if abs(scale - 1.0) > 1e-9:
-            print(f"📊 [趨勢] 波動度部位調整：近期波動 {float(recent_vol):.4f} → 倉位係數 x{scale:.2f}")
+            print(f"📊 波動度部位調整：近期波動 {float(recent_vol):.4f} → 倉位係數 x{scale:.2f}")
         # 深負費率加碼：與回測/主程式共用 apply_funding_boost（單一事實來源）
         boosted = apply_funding_boost(scale, btc_funding_3d, FUNDING_BOOST)
         if abs(boosted - scale) > 1e-9:
             print(f"🚀 [趨勢] 深負費率加碼：BTC 3日均費率 {float(btc_funding_3d)*100:+.4f}%/8h → 倉位係數 x{scale:.2f}→x{boosted:.2f}")
             scale = boosted
-        notional = free * QTY_PCT / 100 * LEV * scale
+        notional = free * qty_pct / 100 * LEV * scale
         qty = self._fmt_amt(notional / price)
         mn = self.ex.market(self.symbol)["limits"]["amount"]["min"] or 0.001
         return qty if qty >= mn else 0.0
@@ -303,6 +320,11 @@ class MixedLiveTrader:
                 self.trend = None
                 self.active = "none"
                 self.save_state()
+            elif self.active == "dip_pos" and self.dip is not None:
+                print(f"✅ [{reason}] 抄底持倉已不在交易所（可能人工平倉），清除本地狀態。")
+                self.dip = None
+                self.active = "none"
+                self.save_state()
             return
 
         if self.active == "harm_pending" and self.harm is not None:
@@ -322,6 +344,10 @@ class MixedLiveTrader:
                 self.trend.entry_price * (1 - P["long_fixed_stop_loss_percent"])
             )
             self._set_exchange_stop_loss(stop, reason)
+            return
+
+        if self.active == "dip_pos" and self.dip is not None:
+            self.dip["qty"] = abs(pos_size)  # 抄底腿設計上無交易所端停損，僅校正數量
             return
 
         if self.active in ("none", "harm_pending"):
@@ -353,7 +379,14 @@ class MixedLiveTrader:
         if DRY_RUN:
             return True
         pos_size = self._exch_pos_size()
-        qty = abs(pos_size) if pos_size not in (None, 0) else (abs(self.trend.qty) if self.trend else 0)
+        if pos_size not in (None, 0):
+            qty = abs(pos_size)
+        elif self.trend:
+            qty = abs(self.trend.qty)
+        elif self.dip:
+            qty = abs(self.dip["qty"])
+        else:
+            qty = 0
         if qty <= 0:
             print("⚠️ 平倉前查無交易所持倉，保留本地狀態等待下次同步。")
             return False
@@ -428,6 +461,44 @@ class MixedLiveTrader:
             print(f"   [趨勢] 移動停損更新 → {self.trend.trail_stop:.2f}")
             if old_trail != self.trend.trail_stop:
                 self._set_exchange_stop_loss(self.trend.trail_stop, "趨勢移動停損更新")
+
+    # ---------- 抄底腿（4h，深負費率事件） ----------
+    def _open_dip(self, bar):
+        entry = float(bar["close"])
+        # 半倉 + 波動度係數；刻意不吃費率加碼（回測驗證的 sizing 不含 boost）
+        qty = self._calc_qty(entry, recent_vol=bar.get("ret_vol"), qty_pct=DIP_QTY_PCT)
+        if qty <= 0:
+            print("🚨 [抄底] 觸發深負費率事件，但資金不足最小下單量，本輪作廢。")
+            log_event(LOG_FILE, strategy="dip", timeframe=TREND_TF, action="skip",
+                      side="buy", reason="insufficient_funds", dry=DRY_RUN)
+            return
+        f3 = bar.get("btc_funding_3d")
+        print(f"🟢 [抄底] BTC 3日均費率 {f3*100:+.4f}%/8h 下穿 {DIP_FUNDING_THRESHOLD*100:.2f}% → "
+              f"市價做多 {qty} @ ~{entry:.2f}（{DIP_HOLD_BARS} 根/30天時間出場，無停損）")
+        order = self._market("buy", qty)  # 設計上無 SL：災難停損實測會精準砍在擠壓前低點
+        if order is None:
+            return
+        self.dip = {"entry": entry, "qty": qty, "entry_time": str(bar.name)}
+        self.active = "dip_pos"
+        log_event(LOG_FILE, strategy="dip", timeframe=TREND_TF, action="entry", side="long",
+                  price=round(entry, 2), qty=qty, dry=DRY_RUN, order_id=order.get("id", ""),
+                  note=f"funding {f3*100:+.4f}%/8h")
+        self.save_state()
+
+    def _manage_dip(self, bar):
+        held = (bar.name - pd.Timestamp(self.dip["entry_time"])) / timeframe_to_timedelta(TREND_TF)
+        if held < DIP_HOLD_BARS:
+            return
+        px = float(bar["close"])
+        pnl = (px - self.dip["entry"]) * self.dip["qty"]
+        print(f"🔴 [抄底] 持有滿 {DIP_HOLD_BARS} 根（30天）→ 市價平多 @ ~{px:.2f}（{pnl:+.2f} USDT）")
+        if not self._close_market("sell"):
+            return
+        log_event(LOG_FILE, strategy="dip", timeframe=TREND_TF, action="exit", side="sell",
+                  price=round(px, 2), qty=self.dip["qty"], reason="time", pnl=round(pnl, 2), dry=DRY_RUN)
+        self.dip = None
+        self.active = "none"
+        self.save_state()
 
     # ---------- 諧波（1h） ----------
     def _detect_harm(self, df):
@@ -562,19 +633,35 @@ class MixedLiveTrader:
 
     # ---------- 協調 ----------
     def on_4h(self, bar):
+        # 抄底腿武裝管理：費率回到閾值上方 → 重新武裝；下穿且武裝中 → 觸發一次
+        f3 = bar.get("btc_funding_3d")
+        has_f = f3 is not None and not pd.isna(f3)
+        if has_f and f3 >= DIP_FUNDING_THRESHOLD:
+            self.dip_armed = True
+        dip_trigger = DIP_ENABLED and self.dip_armed and has_f and f3 < DIP_FUNDING_THRESHOLD
+        if dip_trigger:
+            self.dip_armed = False  # 同一輪深負期間只觸發一次；倉位被佔用即作廢（與回測一致）
+
         if self.active == "trend":
             self._manage_trend(bar)
+        elif self.active == "dip_pos":
+            self._manage_dip(bar)
         elif self.active in ("none", "harm_pending"):
             if long_signal(bar, P):
                 if self.active == "harm_pending":
                     if not self._cancel_harm("趨勢優先"):
                         return
                 self._open_trend(bar)
-        # harm_pos: 趨勢讓步等諧波結束
+            elif dip_trigger:
+                if self.active == "harm_pending":
+                    if not self._cancel_harm("深負費率抄底進場"):
+                        return
+                self._open_dip(bar)
+        # harm_pos: 趨勢/抄底讓步等諧波結束
 
     def on_1h(self, bar, df):
-        if self.active == "trend":
-            return
+        if self.active in ("trend", "dip_pos"):
+            return  # 趨勢/抄底持倉中，諧波讓步（互斥）
         if self.active == "harm_pending":
             self._manage_harm_pending(df)
         elif self.active == "harm_pos":
@@ -595,6 +682,7 @@ class MixedLiveTrader:
                   "trail_active": self.trend.trail_active, "trail_stop": self.trend.trail_stop,
                   "bars_held": self.trend.bars_held}
         st = {"active": self.active, "trend": tp, "harm": self.harm,
+              "dip": self.dip, "dip_armed": self.dip_armed,
               "last_signal_key": self.last_signal_key,
               "last_4h": str(self.last_4h) if self.last_4h is not None else None,
               "last_1h": str(self.last_1h) if self.last_1h is not None else None}
@@ -632,6 +720,12 @@ class MixedLiveTrader:
                           "take_profit": round(self.harm["tp"], 2), "qty": self.harm["qty"],
                           "since": _tw(self.harm["placed"]) if self.harm.get("placed") else "",
                           "note": "等 SL/TP 觸發"})
+        elif self.active == "dip_pos" and self.dip is not None:
+            items.append({"status": "抄底持倉中", "strategy": "dip", "side": "long", "pattern": "",
+                          "entry": round(self.dip["entry"], 2), "stop_loss": "無(設計如此)",
+                          "take_profit": "", "qty": self.dip["qty"],
+                          "since": _tw(self.dip["entry_time"]),
+                          "note": f"深負費率事件，{DIP_HOLD_BARS}根(30天)時間出場"})
         elif self.active == "external_pos":
             items.append({"status": "交易所已有未記錄持倉", "strategy": "external",
                           "side": "", "pattern": "", "entry": "", "stop_loss": "",
@@ -644,6 +738,7 @@ class MixedLiveTrader:
         try:
             s = json.load(open(STATE_FILE, encoding="utf-8"))
             self.active = s.get("active", "none"); self.harm = s.get("harm")
+            self.dip = s.get("dip"); self.dip_armed = s.get("dip_armed", True)
             self.last_signal_key = s.get("last_signal_key")
             self.last_4h = pd.to_datetime(s["last_4h"]) if s.get("last_4h") else None
             self.last_1h = pd.to_datetime(s["last_1h"]) if s.get("last_1h") else None
