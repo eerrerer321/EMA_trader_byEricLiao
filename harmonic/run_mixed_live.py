@@ -39,6 +39,7 @@ from trade_logger import log_event, write_active, ensure_log_header  # noqa: E40
 from eth_strategy_4h_autotrading import (  # noqa: E402
     calculate_indicators, fetch_bybit_klines, get_latest_completed_bar, timeframe_to_timedelta,
     STRATEGY_PARAMS, MIN_PLAUSIBLE_EQUITY_USDT, FUNDING_BOOST, apply_funding_boost,
+    fetch_btc_funding_3d,
 )
 from backtest_eth_strategy_4h import (  # noqa: E402
     Position, update_trailing_stop, check_stop_exit, long_signal, short_signal,
@@ -159,20 +160,12 @@ class MixedLiveTrader:
             return 0.0
 
     def _btc_funding_3d(self):
-        """BTC 幣本位 3 日平滑資金費率（最近 9 筆 8h 均值），供 long_signal 多頭擁擠過濾。
+        """BTC 幣本位 3 日平滑資金費率，委派主程式共用實作（含重試 + last-good 快取）。
 
-        公開端點、無需 API key；失敗回 None → 過濾自動旁路（fail-open：
-        過濾是錦上添花，不能因行情服務異常而擋住正常交易）。
+        單一事實來源：費率讀取的重試/快取/旁路語意三入口一致；用公開行情連線
+        （與認證交易連線分離，不爭用 rate budget）。
         """
-        try:
-            hist = self.ex.fetch_funding_rate_history("BTC/USD:BTC", limit=9)
-            rates = [float(r["fundingRate"]) for r in hist if r.get("fundingRate") is not None]
-            if len(rates) >= 3:
-                return sum(rates) / len(rates)
-            print("⚠️ BTC 資金費率筆數不足，本根 K 線跳過擁擠過濾。")
-        except Exception as e:
-            print(f"⚠️ 讀取 BTC 資金費率失敗（{e}），本根 K 線跳過擁擠過濾。")
-        return None
+        return fetch_btc_funding_3d()
 
     def _check_position_mode(self):
         """實單啟動前確認帳戶為單向（one-way）持倉。

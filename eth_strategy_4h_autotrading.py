@@ -436,20 +436,46 @@ def apply_funding_boost(base_scale, btc_funding_3d, boost):
     return float(min(base_scale * boost.get("factor", 1.5), boost.get("cap", VOL_SCALE_MAX)))
 
 
-def fetch_btc_funding_3d():
+# 最近一次成功讀到的 BTC 3 日均費率 (epoch_seconds, value)，供讀取失敗時沿用。
+_LAST_GOOD_BTC_FUNDING = None
+# 3 日平滑費率數小時內幾乎不動，沿用 last-good 的最大容許陳舊時間。
+BTC_FUNDING_MAX_STALE_HOURS = 12
+
+
+def fetch_btc_funding_3d(retries=3, backoff_seconds=2.0):
     """BTC 幣本位 3 日平滑資金費率（最近 9 筆 8h 均值），供 long_signal 擁擠過濾。
 
-    公開端點、無需 API key；失敗回 None → 過濾自動旁路（fail-open）。
+    公開端點、無需 API key。實測 4h K 線收線時多 bot 同時打 API，funding 端點
+    偶發瞬時失敗（時段相依，受控探針打不出來），故：
+      1. 瞬時失敗重試（retries 次，間隔 backoff_seconds）；
+      2. 全部重試仍失敗 → 沿用近期 last-good 值（3 日均費率數小時內幾乎不動），
+         避免讀取失敗時「靜默停用過濾」這個 fail-open 風控缺口；
+      3. 連 last-good 都沒有（或過舊）才回 None，由呼叫端旁路。
     """
-    try:
-        exchange = _get_public_exchange()
-        hist = exchange.fetch_funding_rate_history("BTC/USD:BTC", limit=9)
-        rates = [float(r["fundingRate"]) for r in hist if r.get("fundingRate") is not None]
-        if len(rates) >= 3:
-            return sum(rates) / len(rates)
-        print("⚠️ BTC 資金費率筆數不足，本根 K 線跳過擁擠過濾。")
-    except Exception as e:
-        print(f"⚠️ 讀取 BTC 資金費率失敗（{e}），本根 K 線跳過擁擠過濾。")
+    global _LAST_GOOD_BTC_FUNDING
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            exchange = _get_public_exchange()
+            hist = exchange.fetch_funding_rate_history("BTC/USD:BTC", limit=9)
+            rates = [float(r["fundingRate"]) for r in hist if r.get("fundingRate") is not None]
+            if len(rates) >= 3:
+                val = sum(rates) / len(rates)
+                _LAST_GOOD_BTC_FUNDING = (time.time(), val)
+                return val
+            last_err = "資料筆數不足"
+        except Exception as e:
+            last_err = e
+        if attempt < retries:
+            time.sleep(backoff_seconds)
+    # 全部重試失敗 → 沿用近期 last-good（風控不靜默停用）
+    if _LAST_GOOD_BTC_FUNDING is not None:
+        ts, val = _LAST_GOOD_BTC_FUNDING
+        age_h = (time.time() - ts) / 3600
+        if age_h <= BTC_FUNDING_MAX_STALE_HOURS:
+            print(f"⚠️ BTC 費率讀取失敗（{last_err}），沿用 {age_h:.1f}h 前的值 {val*100:+.4f}%/8h。")
+            return val
+    print(f"⚠️ 讀取 BTC 資金費率失敗（{last_err}）且無可用近期值，本根 K 線跳過擁擠過濾。")
     return None
 
 
