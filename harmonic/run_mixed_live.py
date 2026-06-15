@@ -31,6 +31,7 @@ warnings.filterwarnings("ignore", message=".*doesn't match a supported version.*
 
 import ccxt
 import pandas as pd
+import requests
 from dotenv import load_dotenv
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -79,6 +80,19 @@ VOL_TARGET = live_vol_target()
 DIP_ENABLED = os.getenv("HARMONIC_DIP_ENABLED", "1") != "0"
 DIP_QTY_PCT = QTY_PCT / 2          # 半倉
 DIP_FUNDING_THRESHOLD = -0.0001    # 與費率假說 deep_neg 分桶邊界一致（非擬合值）
+
+# === CVD 背離降風險微調（使用者 2026-06-15 觀察＋核准） ===
+# 規律：價格漲但 CVD（taker 主動買−賣）沒跟上＝空虛上漲/追多脆弱 → 易跌。
+# 動作：趨勢腿開倉時，若近 42 根(4h) 正規化 CVD 動能(Σdelta/Σvol) < 0，倉位 ×0.5（半倉）。
+#       只作用在趨勢腿（與回測一致），諧波/抄底腿不受影響。CVD 與費率正交（相關 −0.21）。
+# 實證（完整 5 關：前瞻→OOS→正交→獨立增量→混合增量全過）：三腿混合 ETH MDD −18.7→−14.6、
+#   Calmar 1.57→1.82、滾動 80.8→84.6%、Sharpe 持平；BTC 全面改善。是降風險 overlay（換報酬得更穩/更小回撤）。
+# CVD 取自 Binance 期貨 K 線 taker 量（Bybit K 線不提供），失敗 fail-open（不調整，full size）。
+CVD_TILT_ENABLED = os.getenv("HARMONIC_CVD_TILT", "1") != "0"
+CVD_TILT_FACTOR = 0.5
+CVD_TILT_LOOKBACK = 42             # 4h 根數（與回測一致）
+_BINANCE_FAPI = "https://fapi.binance.com/fapi/v1/klines"
+_LAST_GOOD_CVD = None              # (epoch_seconds, momentum)，fail-open 沿用
 DIP_HOLD_BARS = 180                # 30 天的 4h 根數
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mixed_state.json")
 
@@ -167,6 +181,33 @@ class MixedLiveTrader:
         """
         return fetch_btc_funding_3d()
 
+    def _cvd_tilt(self):
+        """趨勢腿 CVD 背離降風險係數：近 CVD_TILT_LOOKBACK 根正規化 CVD 動能 (Σdelta/Σvol) < 0
+        ＝空虛上漲 → 回 CVD_TILT_FACTOR(0.5)；否則 1.0。CVD 取 Binance 期貨 taker 量
+        （Bybit K 線不提供）。失敗沿用近期 last-good（12h 內），再不行回 1.0（fail-open 不調整）。
+        只供趨勢腿使用，與回測 cvd_mix_eval 定義一致。"""
+        global _LAST_GOOD_CVD
+        if not CVD_TILT_ENABLED:
+            return 1.0
+        try:
+            bsym = self.symbol.replace("/", "")  # ETH/USDT -> ETHUSDT
+            k = requests.get(_BINANCE_FAPI, params={"symbol": bsym, "interval": TREND_TF,
+                             "limit": CVD_TILT_LOOKBACK + 5}, timeout=15).json()
+            if isinstance(k, list) and len(k) >= CVD_TILT_LOOKBACK + 1:
+                kk = k[:-1][-CVD_TILT_LOOKBACK:]   # 丟最後一根未收完的，取已收完的 N 根
+                vol = sum(float(x[5]) for x in kk)
+                delta = sum(2 * float(x[9]) - float(x[5]) for x in kk)  # x[9]=taker buy base
+                if vol > 0:
+                    mom = delta / vol
+                    _LAST_GOOD_CVD = (time.time(), mom)
+                    return CVD_TILT_FACTOR if mom < 0 else 1.0
+            print("⚠️ CVD K 線筆數不足，本次趨勢開倉跳過 CVD 微調。")
+        except Exception as e:
+            print(f"⚠️ 讀取 CVD 失敗（{e}），本次趨勢開倉跳過 CVD 微調。")
+        if _LAST_GOOD_CVD is not None and (time.time() - _LAST_GOOD_CVD[0]) / 3600 <= 12:
+            return CVD_TILT_FACTOR if _LAST_GOOD_CVD[1] < 0 else 1.0
+        return 1.0
+
     def _check_position_mode(self):
         """實單啟動前確認帳戶為單向（one-way）持倉。
 
@@ -223,7 +264,7 @@ class MixedLiveTrader:
         print(f"🚨 Bybit 槓桿 {actual}x < 程式名目槓桿 {LEV:.0f}x，本次開倉取消。請調高交易所槓桿或降低 LEV。")
         return False
 
-    def _calc_qty(self, price, recent_vol=None, btc_funding_3d=None, qty_pct=QTY_PCT):
+    def _calc_qty(self, price, recent_vol=None, btc_funding_3d=None, qty_pct=QTY_PCT, cvd_tilt=1.0):
         if not self._ensure_leverage_capacity():
             return 0.0
         free = self._free()
@@ -238,6 +279,10 @@ class MixedLiveTrader:
         if abs(boosted - scale) > 1e-9:
             print(f"🚀 [趨勢] 深負費率加碼：BTC 3日均費率 {float(btc_funding_3d)*100:+.4f}%/8h → 倉位係數 x{scale:.2f}→x{boosted:.2f}")
             scale = boosted
+        # CVD 背離降風險微調（只趨勢腿傳 <1，諧波/抄底腿恆 1.0 不受影響）
+        if abs(cvd_tilt - 1.0) > 1e-9:
+            print(f"🛡️ [趨勢] CVD 背離降風險：空虛上漲(價漲但缺主動買盤) → 倉位係數 x{scale:.2f}→x{scale*cvd_tilt:.2f}")
+            scale *= cvd_tilt
         notional = free * qty_pct / 100 * LEV * scale
         qty = self._fmt_amt(notional / price)
         mn = self.ex.market(self.symbol)["limits"]["amount"]["min"] or 0.001
@@ -412,9 +457,10 @@ class MixedLiveTrader:
     # ---------- 趨勢（4h，重用回測邏輯） ----------
     def _open_trend(self, bar):
         entry = float(bar["close"])
-        # 與回測一致：用訊號 bar 的 ret_vol / btc_funding_3d 做倉位調整（諧波腿不適用）
+        # 與回測一致：用訊號 bar 的 ret_vol / btc_funding_3d 做倉位調整，並套 CVD 背離降風險（諧波/抄底腿不適用）
         qty = self._calc_qty(entry, recent_vol=bar.get("ret_vol"),
-                             btc_funding_3d=bar.get("btc_funding_3d"))
+                             btc_funding_3d=bar.get("btc_funding_3d"),
+                             cvd_tilt=self._cvd_tilt())
         if qty <= 0:
             print("資金不足，趨勢進場略過。")
             return
