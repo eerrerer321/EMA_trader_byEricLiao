@@ -2552,9 +2552,10 @@ def run_live_trading():
                     or current_bar.name > last_kline_timestamp
                 ):
                     # 先換行，避免覆蓋動態狀態行
-                    # 將 UTC 時間轉換為台北時間顯示
-                    kline_taipei_time = current_bar.name + timedelta(hours=8)
-                    print(f"\n\n🔔 檢測到新 4小時 K 線: {kline_taipei_time}")
+                    # 將 UTC 時間轉換為台北時間顯示（標籤為開盤時間，另標收盤時間避免誤會）
+                    kline_open_tpe = current_bar.name + timedelta(hours=8)
+                    kline_close_tpe = current_bar.name + timeframe_to_timedelta(TIMEFRAME) + timedelta(hours=8)
+                    print(f"\n\n🔔 檢測到新 4小時 K 線: 開 {kline_open_tpe} → 收 {kline_close_tpe} (台灣)")
                     print(f"⏰ 開始技術分析和交易判斷...")
 
                     # 注入 BTC 資金費率（None 時 long_signal 擁擠過濾自動旁路）

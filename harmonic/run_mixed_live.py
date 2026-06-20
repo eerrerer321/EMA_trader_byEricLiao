@@ -808,7 +808,8 @@ class MixedLiveTrader:
                         b4["btc_funding_3d"] = self._btc_funding_3d()  # None 時過濾自動旁路
                         f_msg = (f" | BTC費率(3d) {b4['btc_funding_3d']*100:+.4f}%"
                                  if b4["btc_funding_3d"] is not None else "")
-                        print(f"\n🔔 新 4h K 線 {_tw(b4.name)} (台灣) | 價 {b4['close']:.2f} EMA200 {b4['ema200']:.2f}{f_msg} | 狀態 {_active_label(self.active)}")
+                        _cl = _tw(b4.name + timeframe_to_timedelta(TREND_TF))  # 收盤時間（台灣），避免開盤標籤誤會
+                        print(f"\n🔔 新 4h K 線 開 {_tw(b4.name)} → 收 {_cl} (台灣) | 價 {b4['close']:.2f} EMA200 {b4['ema200']:.2f}{f_msg} | 狀態 {_active_label(self.active)}")
                         self.last_4h = b4.name; self.on_4h(b4); self.save_state()
 
                     df1 = calculate_indicators(fetch_bybit_klines(SYMBOL, HARM_TF, limit=1000))
