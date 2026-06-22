@@ -326,6 +326,12 @@ def calculate_indicators(df):
     """計算所有技術指標"""
     df = df.copy()
 
+    # 空表防護：行情抓取瞬斷時 fetch_bybit_klines 會回傳空表（已自行印出網路錯誤）。
+    # 此處原樣返回，避免在 df["close"] 上拋出隱晦的 KeyError('close')；下游
+    # get_latest_completed_bar(空表) 會回 None，呼叫端的 if bar is not None 自動跳過本輪。
+    if df.empty or "close" not in df.columns:
+        return df
+
     # EMA指標
     df["ema90"] = calculate_ema(df["close"], 90)
     df["ema200"] = calculate_ema(df["close"], 200)
