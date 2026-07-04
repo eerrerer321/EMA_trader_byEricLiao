@@ -37,7 +37,7 @@ from backtest_eth_strategy_4h import (
     load_ohlcv_csv,
     run_backtest,
 )
-from eth_strategy_4h_autotrading import (
+from strategy_core import (
     DEFAULT_QTY_PERCENT,
     STRATEGY_PARAMS,
     SYMBOL,

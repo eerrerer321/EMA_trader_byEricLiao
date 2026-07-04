@@ -65,7 +65,7 @@
 ### 風險控制機制
 - **固定停損**: 多單3.2381% / 空單1.4180%，進場後同步到 Bybit 交易所端保護單
 - **移動停損**: 智能追蹤止盈保護獲利，觸發或更新時同步調整交易所端停損
-- **資金管理**: 每筆交易使用20%可用資金 × 3倍名目槓桿（名目曝險約60%），複利滾入
+- **資金管理**: 每筆交易使用30%可用資金 × 3倍名目槓桿（名目曝險約90%），複利滾入（實盤預設值；上方績效回測以較保守的 20% 配置／名目約 60% 驗證）
 - **波動度目標倉位**: 倉位 × (目標波動 ÷ 近期波動)，限制 0.3~2.0 倍——平穩趨勢自動加碼、劇烈震盪自動縮手（實測報酬接近翻倍、回撤不變）
 - **BTC 費率「多頭擁擠」過濾**: BTC 幣本位 3 日均資金費率 > 0.01%/8h 時不開新多單（該情境歷史多單 PF 僅 0.81；過濾後 PF 1.58→1.72、滾動獲利率 69→73%）
 - **BTC 深負費率加碼**: 費率 < −0.01%/8h（空方深度擁擠）時新多單 ×1.5、總係數 cap 2.0（三資料集報酬提升、MDD 完全不變）
@@ -132,11 +132,13 @@ TRADE_SYMBOL=ETH/USDT
 
 ### 運行策略
 
+實盤主程式為混合實盤 `harmonic/run_mixed_live.py`（含本策略趨勢腿 + 諧波腿 + 費率抄底腿，互斥持倉、趨勢優先）：
+
 ```bash
-python eth_strategy_4h_autotrading.py
+python harmonic/run_mixed_live.py
 ```
 
-按 Enter 確認開始執行，保持 CMD 視窗開啟以維持自動交易。
+預設 DRY-RUN（觀察模式）；環境變數 `HARMONIC_DRY_RUN=0` 才實際下單，實單啟動需按 Enter 確認風險，保持 CMD 視窗開啟以維持自動交易。詳見 [harmonic/README.md](harmonic/README.md)。
 
 ## 策略參數
 
@@ -176,19 +178,23 @@ python eth_strategy_4h_autotrading.py
 | 警戒 | 回撤 ≥ 1.5× baseline | 開倉資金減半 |
 | 熔斷 | 回撤 ≥ 2.0× baseline | 暫停開新倉（既有倉位停損照常運作） |
 
-設計依據：Grossman-Zhou (1993) / CPPI「回撤越深、曝險越低」原則，搭配系統交易實務的 drawdown-multiple 門檻（~1.5× 警戒、~2.0× 視為失效）。可在 `eth_strategy_4h_autotrading.py` 頂部用 `CIRCUIT_BREAKER_ENABLED` 開關、`SYMBOL_CIRCUIT_BREAKER_BASELINE` 調整。回撤縮回後自動恢復正常曝險。
+設計依據：Grossman-Zhou (1993) / CPPI「回撤越深、曝險越低」原則，搭配系統交易實務的 drawdown-multiple 門檻（~1.5× 警戒、~2.0× 視為失效）。可在 `strategy_core.py` 頂部用 `CIRCUIT_BREAKER_ENABLED` 開關、`SYMBOL_CIRCUIT_BREAKER_BASELINE` 調整。回撤縮回後自動恢復正常曝險。
 
 ## 專案結構
 
 ```
 EMA_trader_byEricLiao/
-├── eth_strategy_4h_autotrading.py  # 主程式文件
+├── strategy_core.py                # 策略共用核心（指標/進場訊號/K線抓取/費率/配置常數）
+├── backtest_eth_strategy_4h.py     # 回測引擎（Position/停損出場/風控 overlay）
+├── run_best_params_backtest.py     # 最佳參數回測重現
+├── rolling_window_backtest.py      # 滾動視窗驗證
+├── optimize_strategy_optuna.py     # Optuna 參數優化
+├── harmonic/                       # 混合實盤與諧波策略
+│   └── run_mixed_live.py           # 實盤主程式（趨勢+諧波+抄底，預設 DRY-RUN）
 ├── requirements.txt                # Python 依賴套件
-├── strategy_state.json            # 策略狀態保存文件
-├── 最佳參數組合.json               # 回測最佳參數詳情
-├── 使用說明.txt                   # 簡易使用說明
-├── .env                           # API 配置文件 (需自行創建)
-└── README.md                      # 專案說明文件
+├── strategy_state.json             # 策略狀態保存文件（舊單腿引擎遺留）
+├── .env                            # API 配置文件 (需自行創建)
+└── README.md                       # 專案說明文件
 ```
 
 ## 交易邏輯

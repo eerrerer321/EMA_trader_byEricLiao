@@ -37,14 +37,14 @@ from dotenv import load_dotenv
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from trade_logger import log_event, write_active, ensure_log_header  # noqa: E402
-from eth_strategy_4h_autotrading import (  # noqa: E402
+from strategy_core import (  # noqa: E402
     calculate_indicators, fetch_bybit_klines, get_latest_completed_bar, timeframe_to_timedelta,
-    STRATEGY_PARAMS, MIN_PLAUSIBLE_EQUITY_USDT, FUNDING_BOOST, apply_funding_boost,
+    STRATEGY_PARAMS, MIN_PLAUSIBLE_EQUITY_USDT, MAX_PLAUSIBLE_DRAWDOWN, FUNDING_BOOST, apply_funding_boost,
     fetch_btc_funding_3d,
 )
 from backtest_eth_strategy_4h import (  # noqa: E402
     Position, update_trailing_stop, check_stop_exit, long_signal, short_signal,
-    vol_target_scale, live_vol_target,
+    vol_target_scale, live_vol_target, circuit_breaker_scale, live_circuit_breaker,
 )
 from harmonic_strategy import find_pivots, match, TP_RATIO, SL_BUFFER, QTY_PCT, LEV  # noqa: E402
 
@@ -67,6 +67,7 @@ P = dict(STRATEGY_PARAMS)
 # Bybit 2021-2026）：只加趨勢腿報酬 291%→530% / 99%→182%、Calmar 0.51→0.69 /
 # 0.80→1.10，滾動視窗獲利率不變；諧波腿加了反而讓滾動獲利率 78%→74%，故諧波維持固定倉位。
 VOL_TARGET = live_vol_target()
+CIRCUIT_BREAKER = live_circuit_breaker()  # B9：回撤熔斷設定（None=停用）；以權益高水位回撤分級降/暫停新開倉
 
 # === 深負費率「抄底腿」（使用者 2026-06-12 核准半倉版） ===
 # 進場：3 日均 BTC 幣本位費率「由上往下穿越」-0.01%/8h（深負=空方深度擁擠=軋空燃料；
@@ -143,7 +144,16 @@ class MixedLiveTrader:
         self.last_signal_key = None  # 已處理過的諧波 C 樞軸，避免對同型態重複掛單
         self.last_4h = None
         self.last_1h = None
+        self.equity_peak = 0.0      # B9：權益高水位（HWM），回撤熔斷用；由 load_state 還原
+        self._last_good_equity = None  # B9：(epoch, equity) 最近一次成功讀到的總權益，瞬斷時沿用
         self.load_state()
+        if CIRCUIT_BREAKER and self.equity_peak <= 0:  # B9：首次啟動/無持久化 → 以當前總權益播種
+            eq0 = self._total_equity()
+            if eq0 >= MIN_PLAUSIBLE_EQUITY_USDT:
+                self.equity_peak = eq0
+                print(f"⚠️ [熔斷] 無歷史權益高水位記錄，以當前總權益 {eq0:.2f} USDT 播種（歷史回撤未知）。")
+            else:
+                print("⚠️ [熔斷] 啟動時無法取得合理總權益，高水位暫未播種（下次同步補上）。")
         if not self._check_position_mode():
             raise SystemExit("持倉模式不符，已中止啟動。")
         self._ensure_leverage_capacity()  # 啟動先驗一次（失敗只警告；每次開倉前還會再擋）
@@ -172,6 +182,67 @@ class MixedLiveTrader:
             return float(self.ex.fetch_balance().get("free", {}).get("USDT", 0) or 0)
         except Exception:
             return 0.0
+
+    def _total_equity(self):
+        """總權益（供回撤熔斷 HWM/drawdown 用，非 sizing）。Bybit unified 取 totalEquity，
+        備援 ccxt 統一 total["USDT"]。DRY_RUN 用模擬資金。讀不到合理值回 0.0（呼叫端 fail-closed）。"""
+        if DRY_RUN:
+            return DRY_RUN_SIM_CAPITAL
+        eq = 0.0
+        try:
+            bal = self.ex.fetch_balance({"accountType": "UNIFIED"})
+            try:
+                eq = float(bal.get("info", {}).get("result", {}).get("list", [{}])[0].get("totalEquity", 0) or 0)
+            except Exception:
+                eq = 0.0
+            if eq < MIN_PLAUSIBLE_EQUITY_USDT:  # 備援：ccxt 統一欄位
+                eq = float(bal.get("total", {}).get("USDT", 0) or 0)
+        except Exception as e:
+            print(f"查詢總權益失敗: {e}")
+            eq = 0.0
+        if eq >= MIN_PLAUSIBLE_EQUITY_USDT:
+            self._last_good_equity = (time.time(), eq)
+            return eq
+        # 讀取失敗/壞讀：沿用近期 last-good（≤15 分），避免瞬斷誤觸 fail-closed（與 _btc_funding_3d 同模式）
+        if self._last_good_equity is not None and (time.time() - self._last_good_equity[0]) <= 900:
+            return self._last_good_equity[1]
+        return 0.0
+
+    def _drawdown_scale(self):
+        """回撤熔斷係數：讀總權益→更新高水位→算回撤→回 circuit_breaker_scale。
+        讀不到合理權益 → 回 0.0（fail-closed，擋下新進場，不在盲區照常開倉）。"""
+        if not CIRCUIT_BREAKER:
+            return 1.0
+        eq = self._total_equity()
+        if eq < MIN_PLAUSIBLE_EQUITY_USDT:
+            print("🚨 [熔斷] 無法取得合理總權益，本次新進場暫停（fail-closed）。")
+            return 0.0
+        if eq > self.equity_peak:   # 只用合理讀數升高 HWM，瞬態低讀不毒化
+            self.equity_peak = eq
+        dd = (self.equity_peak - eq) / self.equity_peak if self.equity_peak > 0 else 0.0
+        if dd > MAX_PLAUSIBLE_DRAWDOWN:  # 異常深回撤視為壞讀
+            print(f"🚨 [熔斷] 回撤 {dd:.1%} 超過合理上限，視為壞讀，本次新進場暫停（fail-closed）。")
+            return 0.0
+        cb = circuit_breaker_scale(dd, CIRCUIT_BREAKER)
+        if cb < 1.0:
+            print(f"🛡️ [熔斷] 權益回撤 {dd:.1%}（高水位 {self.equity_peak:.0f}）→ 新倉係數 x{cb:.2f}")
+        return cb
+
+    def _refresh_circuit_breaker(self):
+        """每小時更新權益高水位；若達熔斷暫停級且有未成交諧波掛單，撤單（避免熔斷期間成交）。"""
+        if DRY_RUN or not CIRCUIT_BREAKER:
+            return
+        eq = self._total_equity()
+        if eq < MIN_PLAUSIBLE_EQUITY_USDT:
+            return
+        if eq > self.equity_peak:
+            self.equity_peak = eq
+            self.save_state()  # B9：HWM 升高即持久化，避免崩潰丟失高水位
+        dd = (self.equity_peak - eq) / self.equity_peak if self.equity_peak > 0 else 0.0
+        if dd <= MAX_PLAUSIBLE_DRAWDOWN and circuit_breaker_scale(dd, CIRCUIT_BREAKER) <= 0.0 \
+                and self.active == "harm_pending":
+            print(f"🛡️ [熔斷] 回撤 {dd:.1%} 達暫停級，撤銷未成交諧波掛單。")
+            self._cancel_harm("熔斷暫停")
 
     def _btc_funding_3d(self):
         """BTC 幣本位 3 日平滑資金費率，委派主程式共用實作（含重試 + last-good 快取）。
@@ -205,6 +276,8 @@ class MixedLiveTrader:
         except Exception as e:
             print(f"⚠️ 讀取 CVD 失敗（{e}），本次趨勢開倉跳過 CVD 微調。")
         if _LAST_GOOD_CVD is not None and (time.time() - _LAST_GOOD_CVD[0]) / 3600 <= 12:
+            age_h = (time.time() - _LAST_GOOD_CVD[0]) / 3600
+            print(f"⚠️ CVD 取得失敗，沿用 {age_h:.1f}h 前的快取值。")
             return CVD_TILT_FACTOR if _LAST_GOOD_CVD[1] < 0 else 1.0
         return 1.0
 
@@ -283,6 +356,8 @@ class MixedLiveTrader:
         if abs(cvd_tilt - 1.0) > 1e-9:
             print(f"🛡️ [趨勢] CVD 背離降風險：空虛上漲(價漲但缺主動買盤) → 倉位係數 x{scale:.2f}→x{scale*cvd_tilt:.2f}")
             scale *= cvd_tilt
+        # B9：回撤熔斷（portfolio 風控，最終係數；halt→0→qty 0 跳過進場）。趨勢/抄底/諧波三腿皆經此。
+        scale *= self._drawdown_scale()
         notional = free * qty_pct / 100 * LEV * scale
         qty = self._fmt_amt(notional / price)
         mn = self.ex.market(self.symbol)["limits"]["amount"]["min"] or 0.001
@@ -303,6 +378,50 @@ class MixedLiveTrader:
         except Exception as e:
             print(f"查持倉失敗: {e}")
             return None
+
+    def _exch_pos_entry(self, expected_side=None):
+        """讀取交易所該標的目前持倉的成交均價（avgPrice）。單一部位設計下用於校正進場價。"""
+        if DRY_RUN:
+            return None
+        try:
+            if not hasattr(self.ex, "private_get_v5_position_list"):
+                return None
+            for pos in self.ex.private_get_v5_position_list(
+                    {"category": "linear", "symbol": self.bybit_symbol}).get("result", {}).get("list", []):
+                if float(pos.get("size", 0) or 0) <= 0:
+                    continue
+                if expected_side and pos.get("side") != expected_side:
+                    continue
+                avg = pos.get("avgPrice") or pos.get("entryPrice")
+                return float(avg) if avg not in (None, "", "0", 0) else None
+            return None
+        except Exception as e:
+            print(f"查詢持倉均價失敗: {e}")
+            return None
+
+    def _confirmed_entry(self, order, side, fallback_entry):
+        """市價單送出後，以交易所實際成交均價校正進場價：優先讀部位 avgPrice，
+        備援 fetch_order().average；3 次輪詢仍無則回退訊號收盤價並告警。"""
+        if DRY_RUN or not order or order.get("id") == "DRY":
+            return fallback_entry
+        order_id = order.get("id")
+        expected_side = "Buy" if side == "buy" else "Sell"
+        for attempt in range(1, 4):
+            avg = self._exch_pos_entry(expected_side)
+            if avg and avg > 0:
+                return avg
+            if order_id:
+                try:
+                    fresh = self.ex.fetch_order(order_id, self.symbol, {"category": "linear"})
+                    avg = fresh.get("average") or fresh.get("info", {}).get("avgPrice")
+                    if avg and float(avg) > 0:
+                        return float(avg)
+                except Exception as e:
+                    print(f"查詢成交均價失敗({attempt}/3): {e}")
+            if attempt < 3:
+                time.sleep(1)
+        print(f"⚠️ 無法確認成交均價，暫用訊號收盤價 {fallback_entry:.2f}（移動停損基準可能略偏）。")
+        return fallback_entry
 
     def _set_exchange_stop_loss(self, stop_price, reason):
         if DRY_RUN:
@@ -339,12 +458,17 @@ class MixedLiveTrader:
     def _sync_with_exchange(self, reason="同步"):
         if DRY_RUN:
             return
+        recon = self._reconcile_untracked_orders(reason)  # True=已確認清乾淨 / None=讀取失敗 / False=撤單失敗已暫停
+        if recon is False:  # B5：撤孤兒單失敗已暫停，停在此別讓下方清掉 external_pos
+            return
         pos_size = self._exch_pos_size()
         if pos_size is None:
             print(f"⚠️ [{reason}] 無法確認交易所持倉，保留本地狀態並暫停同步決策。")
             return
         if pos_size == 0:
             if self.active == "external_pos":
+                if recon is not True:  # 開單讀取失敗,無法確認孤兒單已清 → 維持暫停,別誤解除
+                    return
                 print(f"✅ [{reason}] 交易所已無外部持倉，回到等待。")
                 self.active = "none"
                 self.save_state()
@@ -414,8 +538,10 @@ class MixedLiveTrader:
         return self.ex.create_order(self.symbol, "limit", side, qty, price, params)
 
     def _close_market(self, side):
+        """市價平倉。回傳 (是否成功, 實際成交均價或 None)；均價讀不到時呼叫端
+        退回理論價記錄 PnL。DRY-RUN 恆 (True, None)。"""
         if DRY_RUN:
-            return True
+            return True, None
         pos_size = self._exch_pos_size()
         if pos_size not in (None, 0):
             qty = abs(pos_size)
@@ -427,32 +553,90 @@ class MixedLiveTrader:
             qty = 0
         if qty <= 0:
             print("⚠️ 平倉前查無交易所持倉，保留本地狀態等待下次同步。")
-            return False
+            return False, None
         try:
-            self.ex.create_order(self.symbol, "market", side, qty, None,
-                                 {"category": "linear", "positionIdx": POSITION_IDX, "reduceOnly": True})
+            order = self.ex.create_order(self.symbol, "market", side, qty, None,
+                                         {"category": "linear", "positionIdx": POSITION_IDX, "reduceOnly": True})
             time.sleep(2)
             final_pos = self._exch_pos_size()
-            if final_pos is None:
-                print("⚠️ 平倉後無法確認交易所持倉，保留本地狀態等待下次同步。")
-                return False
-            if final_pos != 0:
-                print("⚠️ 平倉後仍偵測到交易所持倉，請人工確認。")
-                return False
-            return True
         except Exception as e:
             print(f"❌ 平倉失敗: {e}")
-            return False
+            return False, None
+        if final_pos is None:
+            print("⚠️ 平倉後無法確認交易所持倉，保留本地狀態等待下次同步。")
+            return False, None
+        if final_pos != 0:
+            print("⚠️ 平倉後仍偵測到交易所持倉，請人工確認。")
+            return False, None
+        # 成敗判定已完成才讀成交均價：均價查詢的任何未來失誤都不得把「已平倉」誤報為失敗
+        return True, self._exit_fill_price(order)
+
+    def _exit_fill_price(self, order):
+        """讀取平倉市價單的實際成交均價；讀不到回 None（呼叫端退回理論價記錄）。
+        出場時部位已歸零，無法像進場那樣讀部位 avgPrice，只能查訂單本身。"""
+        oid = (order or {}).get("id")
+        if not oid:
+            return None
+        try:
+            fresh = self.ex.fetch_order(oid, self.symbol, {"category": "linear"})
+            avg = fresh.get("average") or fresh.get("info", {}).get("avgPrice")
+            return float(avg) if avg and float(avg) > 0 else None
+        except Exception as e:
+            print(f"⚠️ 查詢平倉成交均價失敗，PnL 記錄改用理論價: {e}")
+            return None
 
     def _cancel(self, oid):
         if DRY_RUN or not oid or oid == "DRY":
             return True
-        try:
-            self.ex.cancel_order(oid, self.symbol, {"category": "linear"})
+        for attempt in range(2):  # B19：網路瞬斷重試一次,避免卡在 harm_pending
+            try:
+                self.ex.cancel_order(oid, self.symbol, {"category": "linear"})
+                return True
+            except Exception as e:
+                if attempt == 0:
+                    time.sleep(1)
+                    continue
+                print(f"撤單失敗(可能已成交): {e}")
+        return False
+
+    def _reconcile_untracked_orders(self, reason):
+        """帳戶為本系統專用(owner 確認不手動下單)：撤掉任何「非當前追蹤」的掛單,
+        清掉崩潰/重啟殘留的孤兒限價單。對帳只看部位無法偵測這些單,故另外列舉掛單。
+        回傳 None=讀取失敗略過;False=撤單失敗已暫停;True=無孤兒或已清乾淨。"""
+        if DRY_RUN:
             return True
+        try:
+            orders = self.ex.fetch_open_orders(self.symbol, None, None, {"category": "linear"})
         except Exception as e:
-            print(f"撤單失敗(可能已成交): {e}")
-            return False
+            print(f"⚠️ [{reason}] 讀取掛單失敗，跳過孤兒單對帳: {e}")
+            return None
+        tracked = str((self.harm or {}).get("order_id") or "")
+        ok = True
+        for o in orders or []:
+            oid = str(o.get("id") or "")
+            info = o.get("info", {}) or {}
+            reduce_only = str(o.get("reduceOnly", info.get("reduceOnly", False))).lower() == "true"
+            # 只撤「純限價進場單」：跳過保護性/條件單。注意 Bybit V5 普通單的 stopOrderType 常為
+            # "" 或 "UNKNOWN"（truthy 但非條件單），故須比對「已知條件型別」而非單純 truthy，
+            # 否則會誤判每張單都是保護單 → B5 完全不撤孤兒單（codex 後審抓到）。
+            stop_type = str(info.get("stopOrderType", "")).strip().lower()
+            close_on_trigger = str(info.get("closeOnTrigger", "")).lower() == "true"
+            conditional = (stop_type not in ("", "unknown", "none")
+                           or bool(o.get("triggerPrice") or o.get("stopPrice") or info.get("triggerPrice"))
+                           or close_on_trigger
+                           or str(o.get("type", "")).lower() not in ("", "limit"))
+            if not oid or reduce_only or conditional or (tracked and oid == tracked):
+                continue
+            print(f"⚠️ [{reason}] 偵測到非本系統追蹤的掛單 {oid}，撤單(帳戶為 bot 專用)。")
+            if self._cancel(oid):
+                log_event(LOG_FILE, strategy="reconcile", timeframe="", action="cancel",
+                          reason="orphan_order", dry=False, order_id=oid)
+            else:
+                print("🚨 孤兒掛單撤單失敗，暫停新訊號並等待人工確認。")
+                self.active = "external_pos"
+                self.save_state()
+                ok = False
+        return ok
 
     # ---------- 趨勢（4h，重用回測邏輯） ----------
     def _open_trend(self, bar):
@@ -469,6 +653,16 @@ class MixedLiveTrader:
         order = self._market("buy", qty, sl=sl)
         if order is None:
             return
+        # B3：以交易所實際成交均價校正 entry/qty/SL（市價單可能偏離 bar.close）
+        entry = self._confirmed_entry(order, "buy", entry)
+        filled = self._exch_pos_size()
+        if not DRY_RUN and not filled:  # 實單未確認到持倉 → 不建本地部位(避免幻影),暫停待人工確認
+            print("🚨 [趨勢] 市價單後未確認到持倉，暫停新訊號待人工確認。")
+            self.active = "external_pos"; self.save_state(); return
+        if filled:
+            qty = abs(filled)
+        sl = entry * (1 - P["long_fixed_stop_loss_percent"])
+        self._set_exchange_stop_loss(sl, "趨勢成交均價校正")
         self.trend = Position(side="long", qty=qty, entry_price=entry, entry_time=bar.name, entry_fee=0.0, peak=entry)
         self.active = "trend"
         log_event(LOG_FILE, strategy="trend", timeframe=TREND_TF, action="entry", side="long",
@@ -477,21 +671,25 @@ class MixedLiveTrader:
 
     def _manage_trend(self, bar):
         if short_signal(bar, P):
-            px = float(bar["close"]); pnl = (px - self.trend.entry_price) * self.trend.qty
             print("🔴 [趨勢] 反向訊號 → 平多")
-            if not self._close_market("sell"):
+            ok, fill = self._close_market("sell")
+            if not ok:
                 return
+            px = fill or float(bar["close"])  # 實際成交均價優先，讀不到退回訊號收盤價
+            pnl = (px - self.trend.entry_price) * self.trend.qty
             log_event(LOG_FILE, strategy="trend", timeframe=TREND_TF, action="exit", side="sell",
                       price=round(px, 2), qty=self.trend.qty, reason="reverse", pnl=round(pnl, 2), dry=DRY_RUN)
             self.trend = None; self.active = "none"; self.save_state(); return
         st = check_stop_exit(self.trend, bar, P)
         if st:
-            pnl = (st[1] - self.trend.entry_price) * self.trend.qty
             print(f"🔴 [趨勢] {st[0]} 觸發 @ {st[1]:.2f} → 平多")
-            if not self._close_market("sell"):
+            ok, fill = self._close_market("sell")
+            if not ok:
                 return
+            px = fill or st[1]  # 實際成交均價優先，讀不到退回理論停損價
+            pnl = (px - self.trend.entry_price) * self.trend.qty
             log_event(LOG_FILE, strategy="trend", timeframe=TREND_TF, action="exit", side="sell",
-                      price=round(st[1], 2), qty=self.trend.qty, reason=st[0], pnl=round(pnl, 2), dry=DRY_RUN)
+                      price=round(px, 2), qty=self.trend.qty, reason=st[0], pnl=round(pnl, 2), dry=DRY_RUN)
             self.trend = None; self.active = "none"; self.save_state(); return
         old_trail = self.trend.trail_stop
         update_trailing_stop(self.trend, bar, P)
@@ -517,6 +715,14 @@ class MixedLiveTrader:
         order = self._market("buy", qty)  # 設計上無 SL：災難停損實測會精準砍在擠壓前低點
         if order is None:
             return
+        # B3：以交易所實際成交均價校正 entry/qty（抄底腿設計上無 SL，不重算停損）
+        entry = self._confirmed_entry(order, "buy", entry)
+        filled = self._exch_pos_size()
+        if not DRY_RUN and not filled:  # 實單未確認到持倉 → 不建本地部位(避免幻影),暫停待人工確認
+            print("🚨 [抄底] 市價單後未確認到持倉，暫停新訊號待人工確認。")
+            self.active = "external_pos"; self.save_state(); return
+        if filled:
+            qty = abs(filled)
         self.dip = {"entry": entry, "qty": qty, "entry_time": str(bar.name)}
         self.active = "dip_pos"
         log_event(LOG_FILE, strategy="dip", timeframe=TREND_TF, action="entry", side="long",
@@ -530,9 +736,13 @@ class MixedLiveTrader:
             return
         px = float(bar["close"])
         pnl = (px - self.dip["entry"]) * self.dip["qty"]
-        print(f"🔴 [抄底] 持有滿 {DIP_HOLD_BARS} 根（30天）→ 市價平多 @ ~{px:.2f}（{pnl:+.2f} USDT）")
-        if not self._close_market("sell"):
+        print(f"🔴 [抄底] 持有滿 {DIP_HOLD_BARS} 根（30天）→ 市價平多 @ ~{px:.2f}（約{pnl:+.2f} USDT）")
+        ok, fill = self._close_market("sell")
+        if not ok:
             return
+        if fill:  # 實際成交均價優先，讀不到退回訊號收盤價
+            px = fill
+            pnl = (px - self.dip["entry"]) * self.dip["qty"]
         log_event(LOG_FILE, strategy="dip", timeframe=TREND_TF, action="exit", side="sell",
                   price=round(px, 2), qty=self.dip["qty"], reason="time", pnl=round(pnl, 2), dry=DRY_RUN)
         self.dip = None
@@ -706,7 +916,12 @@ class MixedLiveTrader:
         elif self.active == "harm_pos":
             self._monitor_harm(df)
         elif self.active == "none":
-            sig = self._detect_harm(df)
+            # 只有 _detect_harm 吃「已收完 K 線」切片：形成中 K 線的 close/high/low 會持續變動，
+            # 拿來當樞軸確認 bar 或趨勢過濾（close vs ema200）會 repaint、且與回測
+            # detect_opportunities（只看已收完 bar）分歧。掛限價單本就等回踩，晚 0-59 秒
+            # 偵測不影響成交。_manage_harm_pending / _monitor_harm / _dry_harm_filled
+            # 維持吃完整 df——那些刻意用盤中極值做撤單/成交/SLTP 模擬（議會 2026-07-02 核准）。
+            sig = self._detect_harm(df[df.index <= bar.name])
             if sig and sig["c_time"] != self.last_signal_key:
                 # 只有真的掛出單才消耗 dedup key，否則訊號會被無聲吞掉
                 if self._place_harm(sig, bar.name):
@@ -717,12 +932,13 @@ class MixedLiveTrader:
         tp = None
         if self.trend:
             tp = {"side": self.trend.side, "qty": self.trend.qty, "entry_price": self.trend.entry_price,
-                  "entry_time": str(self.trend.entry_time), "peak": self.trend.peak,
+                  "entry_time": str(self.trend.entry_time), "peak": self.trend.peak, "trough": self.trend.trough,
                   "trail_active": self.trend.trail_active, "trail_stop": self.trend.trail_stop,
                   "bars_held": self.trend.bars_held}
         st = {"active": self.active, "trend": tp, "harm": self.harm,
               "dip": self.dip, "dip_armed": self.dip_armed,
               "last_signal_key": self.last_signal_key,
+              "equity_peak": self.equity_peak,
               "last_4h": str(self.last_4h) if self.last_4h is not None else None,
               "last_1h": str(self.last_1h) if self.last_1h is not None else None}
         try:
@@ -779,14 +995,25 @@ class MixedLiveTrader:
             self.active = s.get("active", "none"); self.harm = s.get("harm")
             self.dip = s.get("dip"); self.dip_armed = s.get("dip_armed", True)
             self.last_signal_key = s.get("last_signal_key")
+            self.equity_peak = float(s.get("equity_peak", 0.0) or 0.0)
             self.last_4h = pd.to_datetime(s["last_4h"]) if s.get("last_4h") else None
             self.last_1h = pd.to_datetime(s["last_1h"]) if s.get("last_1h") else None
             tp = s.get("trend")
             if tp:
                 self.trend = Position(side=tp["side"], qty=tp["qty"], entry_price=tp["entry_price"],
                                       entry_time=pd.to_datetime(tp["entry_time"]), entry_fee=0.0,
-                                      peak=tp.get("peak"), trail_active=tp.get("trail_active", False),
+                                      peak=tp.get("peak"), trough=tp.get("trough"),
+                                      trail_active=tp.get("trail_active", False),
                                       trail_stop=tp.get("trail_stop"), bars_held=tp.get("bars_held", 0))
+            # 壞狀態防護：active 指向的持倉/掛單 payload 缺失（檔案毀損或手動編輯）時
+            # 重設為 none，避免管理函式每根 K 線 AttributeError 崩潰循環且永不自癒。
+            # 實單下若交易所仍有持倉，啟動後第一次每小時同步會偵測到未記錄持倉並
+            # 轉 external_pos 暫停新訊號（fail-safe），不會憑空重複開倉。
+            payload_by_active = {"trend": self.trend, "harm_pending": self.harm,
+                                 "harm_pos": self.harm, "dip_pos": self.dip}
+            if self.active in payload_by_active and payload_by_active[self.active] is None:
+                print(f"⚠️ 狀態檔 active={self.active} 但對應資料缺失，重設為空倉等待（等待同步對帳）。")
+                self.active = "none"
         except Exception as e:
             print(f"載入狀態失敗: {e}")
 
@@ -795,14 +1022,17 @@ class MixedLiveTrader:
         print(f"--- 混合實盤啟動（互斥、趨勢優先）---  狀態: {_active_label(self.active)}")
         last = 0
         last_sync = 0
+        fetch_fails = 0  # observability：連續行情抓取失敗計數（偵測 API 中斷），不參與任何交易決策
         while True:
             try:
                 if not DRY_RUN and time.time() - last_sync >= 3600:
                     self._sync_with_exchange("每小時同步")
+                    self._refresh_circuit_breaker()  # B9：更新權益高水位 + halt 時撤未成交諧波掛單
                     last_sync = time.time()
                 if time.time() - last >= 60:
                     # limit=1000：300/500 根視窗的 EMA200 暖機殘差會產生回測沒有的幽靈訊號
-                    df4 = calculate_indicators(fetch_bybit_klines(SYMBOL, TREND_TF, limit=1000))
+                    raw4 = fetch_bybit_klines(SYMBOL, TREND_TF, limit=1000)
+                    df4 = calculate_indicators(raw4)
                     b4 = get_latest_completed_bar(df4, TREND_TF)
                     if b4 is not None and (self.last_4h is None or b4.name > self.last_4h):
                         b4["btc_funding_3d"] = self._btc_funding_3d()  # None 時過濾自動旁路
@@ -812,10 +1042,20 @@ class MixedLiveTrader:
                         print(f"\n🔔 新 4h K 線 開 {_tw(b4.name)} → 收 {_cl} (台灣) | 價 {b4['close']:.2f} EMA200 {b4['ema200']:.2f}{f_msg} | 狀態 {_active_label(self.active)}")
                         self.last_4h = b4.name; self.on_4h(b4); self.save_state()
 
-                    df1 = calculate_indicators(fetch_bybit_klines(SYMBOL, HARM_TF, limit=1000))
+                    raw1 = fetch_bybit_klines(SYMBOL, HARM_TF, limit=1000)
+                    df1 = calculate_indicators(raw1)
                     b1 = get_latest_completed_bar(df1, HARM_TF)
                     if b1 is not None and (self.last_1h is None or b1.name > self.last_1h):
                         self.last_1h = b1.name; self.on_1h(b1, df1); self.save_state()
+                    # observability-only：偵測行情持續抓取失敗（API 中斷）；純告警，不影響任何交易決策
+                    _empty_tfs = [tf for tf, raw in ((TREND_TF, raw4), (HARM_TF, raw1)) if raw.empty]
+                    if _empty_tfs:
+                        fetch_fails += 1
+                        if fetch_fails in (10, 60, 180) or (fetch_fails > 180 and fetch_fails % 180 == 0):
+                            print(f"🚨 行情抓取連續失敗約 {fetch_fails} 分鐘 | 失敗腿={','.join(_empty_tfs)} | {SYMBOL}，請檢查網路/Bybit。")
+                    elif fetch_fails > 0:
+                        print(f"✅ 行情恢復（中斷約 {fetch_fails} 分鐘）。")
+                        fetch_fails = 0
                     last = time.time()
                 time.sleep(1)
             except Exception as e:

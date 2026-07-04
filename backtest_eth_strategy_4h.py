@@ -23,7 +23,7 @@ from typing import Any
 import ccxt
 import pandas as pd
 
-from eth_strategy_4h_autotrading import (
+from strategy_core import (
     ALLOW_SAME_BAR_REVERSAL,
     CIRCUIT_BREAKER_BASELINE_DRAWDOWN,
     CIRCUIT_BREAKER_ENABLED,
@@ -643,6 +643,26 @@ def print_summary(summary: dict[str, Any]) -> None:
         print(f"4h Sharpe       : {summary['sharpe_4h']:.2f}")
 
 
+def inject_btc_funding_3d(raw_df: pd.DataFrame, funding_csv: str) -> pd.DataFrame:
+    """先算指標、再注入 btc_funding_3d 欄位（供費率「多頭擁擠」過濾與深負加碼）。
+
+    注入必須在 calculate_indicators 之後：core 欄位 dropna 若含 btc_funding_3d，
+    會把費率暖機 NaN 的 K 線一併剔除、位移回測起點（與 cache eval 腳本同作法）。
+    平滑公式對齊實盤 fetch_btc_funding_3d：最近 9 筆 8h 費率均值（min 3 筆）。
+    """
+    df = calculate_indicators(raw_df)
+    funding_series = (
+        pd.read_csv(funding_csv, parse_dates=["timestamp"])
+        .set_index("timestamp")["funding_rate"]
+        .sort_index()
+    )
+    df["btc_funding_3d"] = (
+        funding_series.rolling(9, min_periods=3).mean()
+        .reindex(df.index, method="ffill")
+    )
+    return df
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Backtest the ETH 4h strategy")
     parser.add_argument("--csv", help="Load OHLCV from CSV instead of Bybit")
@@ -667,6 +687,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="關閉回撤熔斷（預設跟隨實盤 CIRCUIT_BREAKER_ENABLED 設定）",
     )
+    parser.add_argument(
+        "--funding-csv",
+        default=None,
+        help="BTC 幣本位費率歷史 CSV（欄位 timestamp,funding_rate；如 "
+        "rolling_backtest_results_cache/funding_btc_inverse.csv）。提供時注入 "
+        "btc_funding_3d 欄位，讓實盤的費率「多頭擁擠」過濾與深負費率加碼在回測生效",
+    )
+    parser.add_argument(
+        "--no-funding-boost",
+        action="store_true",
+        help="關閉深負費率加碼（僅在 --funding-csv 提供時有意義；費率過濾仍生效）",
+    )
     return parser
 
 
@@ -683,6 +715,16 @@ def main() -> None:
             args.end,
         )
 
+    funding_boost = None
+    if args.funding_csv:
+        raw_df = inject_btc_funding_3d(raw_df, args.funding_csv)
+        funding_boost = None if args.no_funding_boost else live_funding_boost()
+    else:
+        print(
+            "ℹ️ 未提供 --funding-csv：實盤的 BTC 費率「多頭擁擠」過濾與深負費率加碼"
+            "在本回測不生效（live_funding_boost 需搭配歷史費率資料）。"
+        )
+
     summary, trades, equity_curve = run_backtest(
         raw_df=raw_df,
         initial_capital=args.initial_capital,
@@ -695,6 +737,7 @@ def main() -> None:
         allow_short=TRADE_SIDE_MODE != "long_only",
         circuit_breaker=None if args.no_circuit_breaker else live_circuit_breaker(),
         vol_target=None if args.no_vol_target else live_vol_target(),
+        funding_boost=funding_boost,
     )
 
     print_summary(summary)

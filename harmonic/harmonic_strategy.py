@@ -38,7 +38,7 @@ import pandas as pd
 
 # 重用主專案的指標計算與 CSV 載入，確保 EMA200/ADX 等與實盤一致
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from eth_strategy_4h_autotrading import calculate_indicators  # noqa: E402
+from strategy_core import calculate_indicators  # noqa: E402
 from backtest_eth_strategy_4h import load_ohlcv_csv  # noqa: E402
 
 # --- 配置 ---

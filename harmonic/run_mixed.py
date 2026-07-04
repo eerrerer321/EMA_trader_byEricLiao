@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from harmonic_strategy import detect_opportunities, backtest as harmonic_backtest, FEE, SLIP, QTY_PCT, LEV  # noqa: E402
-from eth_strategy_4h_autotrading import STRATEGY_PARAMS, calculate_indicators  # noqa: E402
+from strategy_core import STRATEGY_PARAMS, calculate_indicators  # noqa: E402
 from backtest_eth_strategy_4h import (  # noqa: E402
     run_backtest, load_ohlcv_csv, long_signal, short_signal,
     check_stop_exit, update_trailing_stop, open_position as bt_open,

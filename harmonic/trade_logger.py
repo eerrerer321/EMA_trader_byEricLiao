@@ -16,12 +16,84 @@ import csv
 import os
 from datetime import datetime
 
+import requests
+
 FIELDS = ["time", "strategy", "timeframe", "action", "side", "pattern",
           "price", "qty", "sl", "tp", "reason", "pnl", "dry", "order_id", "note"]
 
 # 「當前活躍」快照欄位（只列尚未停利/停損的掛單與持倉）
 ACTIVE_FIELDS = ["update_time", "status", "strategy", "side", "pattern",
                  "entry", "stop_loss", "take_profit", "qty", "since", "note"]
+
+_NOTIFY_ACTIONS = {"place", "entry", "fill", "exit", "cancel", "skip"}
+
+
+def _telegram_target() -> tuple[str | None, str | None]:
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    chat_id = (os.getenv("TELEGRAM_HOME_CHANNEL") or os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+    return (token or None, chat_id or None)
+
+
+def _format_telegram_event(**kw) -> str:
+    status = "DRY-RUN" if str(kw.get("dry", "")).lower() in {"1", "true", "yes"} else "LIVE"
+    ts = kw.get("time") or datetime.now().isoformat(timespec="seconds")
+    strategy = kw.get("strategy", "")
+    tf = kw.get("timeframe", "")
+    action = kw.get("action", "")
+    side = kw.get("side", "")
+    pattern = kw.get("pattern", "")
+    price = kw.get("price", "")
+    qty = kw.get("qty", "")
+    sl = kw.get("sl", "")
+    tp = kw.get("tp", "")
+    reason = kw.get("reason", "")
+    pnl = kw.get("pnl", "")
+    note = kw.get("note", "")
+    lines = [
+        f"{status}｜{ts}",
+        f"{strategy} {tf} {action} {side} {pattern}".strip(),
+    ]
+    details = []
+    if price not in ("", None):
+        details.append(f"價 {price}")
+    if qty not in ("", None):
+        details.append(f"量 {qty}")
+    if sl not in ("", None):
+        details.append(f"SL {sl}")
+    if tp not in ("", None):
+        details.append(f"TP {tp}")
+    if reason not in ("", None):
+        details.append(f"原因 {reason}")
+    if pnl not in ("", None):
+        details.append(f"PnL {pnl}")
+    if note not in ("", None):
+        details.append(f"備註 {note}")
+    if details:
+        lines.append("｜".join(details))
+    return "\n".join(lines)
+
+
+def maybe_send_telegram_event(**kw) -> None:
+    if str(kw.get("action", "")).lower() not in _NOTIFY_ACTIONS:
+        return
+    token, chat_id = _telegram_target()
+    if not token or not chat_id:
+        return
+    text = _format_telegram_event(**kw)
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                "disable_web_page_preview": True,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        # requests 例外訊息可能內嵌請求 URL（含 bot token），印出前遮蔽避免洩漏到日誌
+        print(f"⚠️ Telegram 推播失敗: {str(e).replace(token, '***')}")
 
 
 def log_event(path: str, **kw) -> None:
@@ -37,6 +109,7 @@ def log_event(path: str, **kw) -> None:
             if new_file:
                 w.writeheader()
             w.writerow(row)
+        maybe_send_telegram_event(**row)
     except Exception as e:
         print(f"⚠️ 寫交易日誌失敗: {e}")
 

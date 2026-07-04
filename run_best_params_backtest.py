@@ -15,11 +15,15 @@ from backtest_eth_strategy_4h import (
     DEFAULT_INITIAL_CAPITAL,
     DEFAULT_SLIPPAGE_RATE,
     fetch_ohlcv_from_bybit,
+    inject_btc_funding_3d,
+    live_circuit_breaker,
+    live_funding_boost,
+    live_vol_target,
     load_ohlcv_csv,
     print_summary,
     run_backtest,
 )
-from eth_strategy_4h_autotrading import (
+from strategy_core import (
     DEFAULT_QTY_PERCENT,
     SYMBOL,
     TARGET_POSITION_LEVERAGE,
@@ -44,6 +48,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out-dir", default="best_params_single_backtest")
     parser.add_argument("--side-mode", choices=["best", "both", "long_only", "short_only"], default="best")
     parser.add_argument("--exit-on-reverse-signal", choices=["best", "true", "false"], default="best")
+    parser.add_argument(
+        "--live-overlays",
+        action="store_true",
+        help="套用實盤風控 overlay（回撤熔斷＋波動度目標倉位）驗證實盤等效配置；"
+        "預設關閉以維持與既有快取結果可比。費率過濾/加碼需另搭配 --funding-csv；"
+        "不含 CVD 背離降風險（實盤獨有，所有回測器皆無）",
+    )
+    parser.add_argument(
+        "--funding-csv",
+        default=None,
+        help="BTC 幣本位費率歷史 CSV（timestamp,funding_rate）。提供時注入 btc_funding_3d，"
+        "啟用實盤的費率「多頭擁擠」過濾與深負費率加碼",
+    )
     return parser
 
 
@@ -71,6 +88,8 @@ def main() -> None:
             data_start.strftime("%Y-%m-%d"),
             args.end,
         )
+    if args.funding_csv:
+        raw_df = inject_btc_funding_3d(raw_df, args.funding_csv)
 
     summary, trades, equity_curve = run_backtest(
         raw_df=raw_df,
@@ -85,6 +104,9 @@ def main() -> None:
         exit_on_reverse_signal=exit_on_reverse_signal,
         allow_long=side_mode != "short_only",
         allow_short=side_mode != "long_only",
+        circuit_breaker=live_circuit_breaker() if args.live_overlays else None,
+        vol_target=live_vol_target() if args.live_overlays else None,
+        funding_boost=live_funding_boost() if args.funding_csv else None,
     )
 
     print_summary(summary)

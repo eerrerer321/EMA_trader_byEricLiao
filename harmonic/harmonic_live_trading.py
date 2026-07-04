@@ -37,7 +37,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from trade_logger import log_event  # noqa: E402
-from eth_strategy_4h_autotrading import (  # noqa: E402  複用已驗證的指標與 K 線抓取
+from strategy_core import (  # noqa: E402  複用已驗證的指標與 K 線抓取
     calculate_indicators, fetch_bybit_klines, get_latest_completed_bar, timeframe_to_timedelta,
     MIN_PLAUSIBLE_EQUITY_USDT,
 )
