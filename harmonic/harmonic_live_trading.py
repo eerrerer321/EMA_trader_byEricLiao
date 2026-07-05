@@ -84,6 +84,13 @@ class HarmonicTrader:
         self.position = None        # {entry, sl, tp, bull, pattern, qty}
         self.last_signal_key = None  # 已處理過的 C 樞軸時間戳，避免重複掛同型態
         self.last_processed_kline = None
+        # S4：交易符號必須與 strategy_core 的參數選擇一致（同 run_mixed_live 的防護）
+        import strategy_core as _sc
+        if SYMBOL != _sc.SYMBOL:
+            raise SystemExit(
+                f"符號不一致：本程式交易 {SYMBOL}，但策略參數/風控是 {_sc.SYMBOL} 的"
+                f"（strategy_core 以 TRADE_SYMBOL 決定）。請在 .env 設 TRADE_SYMBOL={SYMBOL}"
+                " 或移除 HARMONIC_SYMBOL。")
         self.load_state()
         self._sync_with_exchange()
         print(f"✅ 諧波交易初始化 | {self.symbol} | {'🟡 DRY-RUN 觀察模式' if DRY_RUN else '🔴 實單模式'}")

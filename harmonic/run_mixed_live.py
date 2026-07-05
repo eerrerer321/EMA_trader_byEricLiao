@@ -146,6 +146,15 @@ class MixedLiveTrader:
         self.last_1h = None
         self.equity_peak = 0.0      # B9：權益高水位（HWM），回撤熔斷用；由 load_state 還原
         self._last_good_equity = None  # B9：(epoch, equity) 最近一次成功讀到的總權益，瞬斷時沿用
+        # S4：交易符號必須與 strategy_core 的參數選擇一致。HARMONIC_SYMBOL 覆蓋交易標的，
+        # 但策略參數/波動目標/熔斷基線全在 strategy_core import 時以 TRADE_SYMBOL 決定——
+        # 不一致=交易 A 標的卻套 B 標的的倉位風控，直接拒啟。
+        import strategy_core as _sc
+        if SYMBOL != _sc.SYMBOL:
+            raise SystemExit(
+                f"符號不一致：本程式交易 {SYMBOL}，但策略參數/風控是 {_sc.SYMBOL} 的"
+                f"（strategy_core 以 TRADE_SYMBOL 決定）。請在 .env 設 TRADE_SYMBOL={SYMBOL}"
+                " 或移除 HARMONIC_SYMBOL。")
         self.load_state()
         if CIRCUIT_BREAKER and self.equity_peak <= 0:  # B9：首次啟動/無持久化 → 以當前總權益播種
             eq0 = self._total_equity()
@@ -491,6 +500,8 @@ class MixedLiveTrader:
 
         if self.active == "harm_pending" and self.harm is not None:
             print(f"✅ [{reason}] 偵測到諧波掛單已成交，轉為持倉狀態。")
+            if not self._cancel_residual_entry(reason):
+                return  # S1：殘單狀態不明已轉 external_pos，不進 harm_pos
             log_event(LOG_FILE, strategy="harmonic", timeframe=HARM_TF, action="fill",
                       side="buy" if self.harm["bull"] else "sell", pattern=self.harm["pattern"],
                       price=self.harm["entry"], qty=abs(pos_size), sl=round(self.harm["sl"], 2),
@@ -633,8 +644,9 @@ class MixedLiveTrader:
                           reason="orphan_order", dry=False, order_id=oid)
             else:
                 print("🚨 孤兒掛單撤單失敗，暫停新訊號並等待人工確認。")
-                self.active = "external_pos"
-                self.save_state()
+                # 不變量（codex 後審）：進 external_pos 必須清 harm——否則自家 harm_pending
+                # 掛單被 tracked 豁免且再無人管理；清掉後它轉孤兒，下輪對帳一併撤銷
+                self._escalate_residual()
                 ok = False
         return ok
 
@@ -693,13 +705,13 @@ class MixedLiveTrader:
             log_event(LOG_FILE, strategy="trend", timeframe=TREND_TF, action="exit", side="sell",
                       price=round(px, 2), qty=self.trend.qty, reason=st[0], pnl=round(pnl, 2), dry=DRY_RUN)
             self.trend = None; self.active = "none"; self.save_state(); return
-        old_trail = self.trend.trail_stop
         update_trailing_stop(self.trend, bar, P)
         self.trend.bars_held += 1
         if self.trend.trail_active and self.trend.trail_stop:
             print(f"   [趨勢] 移動停損更新 → {self.trend.trail_stop:.2f}")
-            if old_trail != self.trend.trail_stop:
-                self._set_exchange_stop_loss(self.trend.trail_stop, "趨勢移動停損更新")
+            # S3：每根都重同步（冪等）而非只在變動時——上一根同步失敗且 trail 不再變動時，
+            # 原寫法在每小時同步前完全不重試；固定重呼叫讓收斂上限=1 根 4h（第三重備援）
+            self._set_exchange_stop_loss(self.trend.trail_stop, "趨勢移動停損更新")
 
     # ---------- 抄底腿（4h，深負費率事件） ----------
     def _open_dip(self, bar):
@@ -830,6 +842,39 @@ class MixedLiveTrader:
         self.save_state()
         return True
 
+    def _cancel_residual_entry(self, context):
+        """S1：撤掉部分成交後殘餘的進場限價單。回傳 True=已確認乾淨（含訂單本就不存在
+        ＝全額成交，最常見）；False=撤銷失敗且訂單仍掛著/無法驗證 → 已轉 external_pos
+        暫停新訊號（殘單「可能還活著」正是要防的危險態，議會 2:1 決議驗證式處理）。"""
+        oid = (self.harm or {}).get("order_id")
+        if DRY_RUN or not oid or oid == "DRY":
+            return True
+        if self._cancel(oid):
+            return True
+        # _cancel False 有兩種可能：訂單已全額成交/已撤（良性、常見）或網路失敗（訂單仍活著）。
+        # 用 open orders 驗證區分，不可默認成功。
+        try:
+            open_ids = {str(o.get("id") or "") for o in
+                        (self.ex.fetch_open_orders(self.symbol, None, None, {"category": "linear"}) or [])}
+        except Exception as e:
+            print(f"🚨 [{context}] 殘餘進場單撤銷失敗且無法驗證（{e}），暫停新訊號待人工確認。")
+            self._escalate_residual()
+            return False
+        if oid in open_ids:
+            print(f"🚨 [{context}] 殘餘進場單 {oid} 撤銷失敗且仍掛在交易所，暫停新訊號待人工確認。")
+            self._escalate_residual()
+            return False
+        return True  # 訂單已不在＝全額成交/已撤，乾淨
+
+    def _escalate_residual(self):
+        """殘單狀態不明的升級處置：必須同時清掉 self.harm——否則殘單仍被
+        _reconcile_untracked_orders 視為「被追蹤」而豁免撤銷，倉位歸零解除
+        external_pos 後殘單依然掛著（codex 後審抓到的回歸路徑）。清掉後殘單
+        變孤兒單，每小時對帳自動接手重試撤銷；持倉本身有交易所端 SL/TP 保護。"""
+        self.harm = None
+        self.active = "external_pos"
+        self.save_state()
+
     def _manage_harm_pending(self, bar):
         """掛單生命週期一律以「已收完 K 線」判定（dry 成交／X 失效／逾時）。
 
@@ -844,6 +889,8 @@ class MixedLiveTrader:
             print("✅ [諧波] 限價單成交 → 持倉（SL/TP 由交易所端執行）")
             if DRY_RUN:
                 self.harm["fill_time"] = str(bar.name)  # dry SL/TP 掃描起點（含成交根）
+            elif not self._cancel_residual_entry("諧波成交"):
+                return  # S1：殘單狀態不明已轉 external_pos，不進 harm_pos（倉位仍有交易所 SL/TP 保護）
             log_event(LOG_FILE, strategy="harmonic", timeframe=HARM_TF, action="fill",
                       side="buy" if self.harm["bull"] else "sell", pattern=self.harm["pattern"],
                       price=self.harm["entry"], qty=self.harm["qty"], sl=round(self.harm["sl"], 2),
@@ -873,11 +920,17 @@ class MixedLiveTrader:
                 # qty，讓平倉記錄的 PnL 對得上實際部位（平倉本身讀交易所 size 不受影響）
                 self.harm["qty"] = abs(pos_size)
             if pos_size == 0:   # 實單：交易所端 SL/TP 已平倉
+                # S1(b)：出場清理也做防禦性殘單撤銷（議會 2:1）——防「轉持倉時撤單從未
+                # 送達（崩潰/競態）」的殘單在倉位歸零後復活成無主新倉
+                residual_ok = self._cancel_residual_entry("諧波出場清理")
                 print("✅ [諧波] 持倉已由交易所 SL/TP 平倉 → 回到等待")
                 log_event(LOG_FILE, strategy="harmonic", timeframe=HARM_TF, action="exit",
                           pattern=self.harm.get("pattern", "") if self.harm else "",
                           reason="exchange_sl_tp", dry=False)
-                self.harm = None; self.active = "none"; self.save_state()
+                self.harm = None
+                if residual_ok:
+                    self.active = "none"
+                self.save_state()
             return
         # DRY-RUN：掃描「成交後 → 最新已收完 K 線」整段區間模擬交易所端 SL/TP。
         # 只看單一 bar 有兩個洞：(1) 形成中 K 線僅幾秒資料，剛收完那小時從未被檢查；
@@ -1087,6 +1140,9 @@ class MixedLiveTrader:
                 time.sleep(1)
             except Exception as e:
                 print(f"\n❌ 主迴圈錯誤: {e}")
+                # S2：例外可能發生在 create_order 已被交易所接受、回應遺失之後——
+                # 強制下一輪立即對帳，把「有倉位卻以為沒有」的盲窗從 ≤1h 壓到 ≤60s
+                last_sync = 0
                 time.sleep(60)
 
 

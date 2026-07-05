@@ -362,18 +362,25 @@ def check_stop_exit(position: Position, bar: pd.Series, params: dict[str, float]
     bar_high = float(bar["high"])
     bar_low = float(bar["low"])
 
+    # 移動停損啟動後，實盤以 tpslMode=Full 的 trading-stop「取代」交易所端停損——
+    # 固定停損此後不存在，故回測也只判 trail（同根貫穿兩水位時實盤在較好的 trail 價
+    # 出場，舊寫法先判 fixed 會模擬出不可能的出場價；議會 2026-07-05 三票一致）。
     fixed_stop = fixed_stop_price(position, params)
     if position.side == "long":
+        if position.trail_active and position.trail_stop:
+            if bar_low <= position.trail_stop:
+                return "trailing_stop", stop_fill_price("long", position.trail_stop, bar_open)
+            return None
         if bar_low <= fixed_stop:
             return "fixed_stop", stop_fill_price("long", fixed_stop, bar_open)
-        if position.trail_active and position.trail_stop and bar_low <= position.trail_stop:
-            return "trailing_stop", stop_fill_price("long", position.trail_stop, bar_open)
         return None
 
+    if position.trail_active and position.trail_stop:
+        if bar_high >= position.trail_stop:
+            return "trailing_stop", stop_fill_price("short", position.trail_stop, bar_open)
+        return None
     if bar_high >= fixed_stop:
         return "fixed_stop", stop_fill_price("short", fixed_stop, bar_open)
-    if position.trail_active and position.trail_stop and bar_high >= position.trail_stop:
-        return "trailing_stop", stop_fill_price("short", position.trail_stop, bar_open)
     return None
 
 
