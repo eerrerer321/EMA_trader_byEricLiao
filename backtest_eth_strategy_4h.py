@@ -650,6 +650,17 @@ def print_summary(summary: dict[str, Any]) -> None:
         print(f"4h Sharpe       : {summary['sharpe_4h']:.2f}")
 
 
+def ensure_symbol_matches_params(cli_symbol: str) -> None:
+    """--symbol 只改抓取的資料；策略參數/波動目標/熔斷基線在 strategy_core import 時
+    以 TRADE_SYMBOL 決定——不一致＝用 A 標的的參數驗證 B 標的的資料，產出無效結果
+    （與實盤啟動的符號防護同級；deploy_gate 誤判尤其危險）。換標的請設 TRADE_SYMBOL。"""
+    sym = (cli_symbol or "").upper().replace(" ", "")
+    if sym and sym != SYMBOL:
+        raise SystemExit(
+            f"--symbol {sym} 與策略參數標的 {SYMBOL} 不一致（參數/風控 overlay 由環境變數"
+            f" TRADE_SYMBOL 決定）。請改用 TRADE_SYMBOL={sym} 重跑，勿只改 --symbol。")
+
+
 def inject_btc_funding_3d(raw_df: pd.DataFrame, funding_csv: str) -> pd.DataFrame:
     """先算指標、再注入 btc_funding_3d 欄位（供費率「多頭擁擠」過濾與深負加碼）。
 
@@ -711,6 +722,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+    ensure_symbol_matches_params(args.symbol)
 
     if args.csv:
         raw_df = load_ohlcv_csv(args.csv)

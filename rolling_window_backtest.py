@@ -20,6 +20,7 @@ from backtest_eth_strategy_4h import (
     DEFAULT_FEE_RATE,
     DEFAULT_INITIAL_CAPITAL,
     DEFAULT_SLIPPAGE_RATE,
+    ensure_symbol_matches_params,
     fetch_ohlcv_from_bybit,
     inject_btc_funding_3d,
     live_circuit_breaker,
@@ -53,6 +54,7 @@ def build_windows(
 
 
 def run_rolling_backtest(args: argparse.Namespace) -> tuple[pd.DataFrame, dict[str, Any]]:
+    ensure_symbol_matches_params(args.symbol)  # 放函式入口：deploy_gate 走此路徑一併受防護
     trade_start = pd.Timestamp(args.start)
     trade_end = pd.Timestamp(args.end)
     data_start = trade_start - pd.DateOffset(months=args.warmup_months)

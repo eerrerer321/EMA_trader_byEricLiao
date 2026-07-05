@@ -14,6 +14,7 @@ from backtest_eth_strategy_4h import (
     DEFAULT_FEE_RATE,
     DEFAULT_INITIAL_CAPITAL,
     DEFAULT_SLIPPAGE_RATE,
+    ensure_symbol_matches_params,
     fetch_ohlcv_from_bybit,
     inject_btc_funding_3d,
     live_circuit_breaker,
@@ -66,6 +67,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+    ensure_symbol_matches_params(args.symbol)
     payload = json.loads(Path(args.best_params).read_text(encoding="utf-8"))
     params = payload["strategy_params"]
     controls = payload.get("controls", {})
