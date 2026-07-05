@@ -130,7 +130,10 @@ def detect_opportunities(df: pd.DataFrame, trend_filter: bool = True, pivot_n: i
                     sl, tp = prz_hi * (1 + SL_BUFFER), entry - TP_RATIO * (entry - A[2])
                     if sl <= entry or A[2] >= entry:
                         break
-                opps.append({"j": j, "entry": entry, "sl": sl, "tp": tp, "bull": bull, "pattern": name})
+                # ts＝進場 bar 時間戳：j 是「偵測時那份 df」的位置索引，消費端若在偵測後
+                # 對 df 切片，位置會無聲錯位指到別根 K 線——ts 讓消費端能大聲驗證對齊
+                opps.append({"j": j, "ts": df.index[j], "entry": entry, "sl": sl, "tp": tp,
+                             "bull": bull, "pattern": name})
                 break
             if done:
                 break
@@ -167,12 +170,16 @@ def simulate_trade(op, h, l, c, n):
 def backtest(df: pd.DataFrame, initial: float = 1000.0, trend_filter: bool = True,
              qty_pct: float = QTY_PCT, lev: float = LEV, pivot_n: int = PIVOT_N):
     """諧波 standalone 回測，回傳 (trades_df, equity_df)。需 df 已含 ema200。"""
+    assert df.index.is_unique, "df.index 有重複時間戳，位置索引對齊防護失效"
     opps = detect_opportunities(df, trend_filter, pivot_n)
     h, l, c = df["high"].values, df["low"].values, df["close"].values
     n = len(df)
     equity, busy = initial, -1
     trades, eq_rows = [], []
     for op in opps:
+        # 放在 busy 跳過之前：所有 opps 一致受驗（bar 對齊防護，見 detect_opportunities）
+        assert 0 <= op["j"] < n, f"opp j={op['j']} 超出 df 長度 {n}（df 與偵測時不同）"
+        assert df.index[op["j"]] == op["ts"], f"opp 位置錯位：df.index[{op['j']}] != {op['ts']}"
         if op["j"] <= busy:
             continue
         bull, entry = op["bull"], op["entry"]

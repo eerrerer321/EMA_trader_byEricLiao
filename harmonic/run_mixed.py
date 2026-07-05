@@ -48,8 +48,14 @@ def mixed_backtest(df, opps, initial=1000.0, params=None,
     - vol_target_harm：諧波腿的波動度目標（與趨勢分開控制，方便對照實驗）。
     """
     params = params or dict(STRATEGY_PARAMS)
+    assert df.index.is_unique, "df.index 有重複時間戳，位置索引對齊防護失效"
     opp_by_j = {}
     for op in opps:
+        # 入口驗證：opps 若來自「不同切片的 df」，位置索引會無聲錯位（吃錯 K 線）
+        # 或無聲漏單（位置對不上被跳過）——兩者都必須大聲失敗（議會 2026-07-05）
+        assert op["ts"] in df.index, f"opp 時間戳 {op['ts']} 不在 df.index（df 與偵測時不同）"
+        assert 0 <= op["j"] < len(df), f"opp j={op['j']} 超出 df 長度 {len(df)}（df 與偵測時不同）"
+        assert df.index[op["j"]] == op["ts"], f"opp 位置錯位：df.index[{op['j']}] != {op['ts']}"
         opp_by_j.setdefault(op["j"], op)
     n = len(df)
     equity = initial
