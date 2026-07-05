@@ -46,7 +46,7 @@ from backtest_eth_strategy_4h import (  # noqa: E402
     Position, update_trailing_stop, check_stop_exit, long_signal, short_signal,
     vol_target_scale, live_vol_target, circuit_breaker_scale, live_circuit_breaker,
 )
-from harmonic_strategy import find_pivots, match, TP_RATIO, SL_BUFFER, QTY_PCT, LEV  # noqa: E402
+from harmonic_strategy import find_pivots, match, FEE, TP_RATIO, SL_BUFFER, QTY_PCT, LEV  # noqa: E402
 
 load_dotenv()
 API_KEY, API_SECRET = os.getenv("BYBIT_API_KEY"), os.getenv("BYBIT_API_SECRET")
@@ -676,7 +676,8 @@ class MixedLiveTrader:
             if not ok:
                 return
             px = fill or float(bar["close"])  # 實際成交均價優先，讀不到退回訊號收盤價
-            pnl = (px - self.trend.entry_price) * self.trend.qty
+            e = self.trend.entry_price
+            pnl = (px - e) * self.trend.qty - self.trend.qty * (e + px) * FEE  # 含 taker 雙邊手續費估計
             log_event(LOG_FILE, strategy="trend", timeframe=TREND_TF, action="exit", side="sell",
                       price=round(px, 2), qty=self.trend.qty, reason="reverse", pnl=round(pnl, 2), dry=DRY_RUN)
             self.trend = None; self.active = "none"; self.save_state(); return
@@ -687,7 +688,8 @@ class MixedLiveTrader:
             if not ok:
                 return
             px = fill or st[1]  # 實際成交均價優先，讀不到退回理論停損價
-            pnl = (px - self.trend.entry_price) * self.trend.qty
+            e = self.trend.entry_price
+            pnl = (px - e) * self.trend.qty - self.trend.qty * (e + px) * FEE  # 含 taker 雙邊手續費估計
             log_event(LOG_FILE, strategy="trend", timeframe=TREND_TF, action="exit", side="sell",
                       price=round(px, 2), qty=self.trend.qty, reason=st[0], pnl=round(pnl, 2), dry=DRY_RUN)
             self.trend = None; self.active = "none"; self.save_state(); return
@@ -742,7 +744,8 @@ class MixedLiveTrader:
             return
         if fill:  # 實際成交均價優先，讀不到退回訊號收盤價
             px = fill
-            pnl = (px - self.dip["entry"]) * self.dip["qty"]
+        pnl = (px - self.dip["entry"]) * self.dip["qty"] \
+            - self.dip["qty"] * (self.dip["entry"] + px) * FEE  # 含 taker 雙邊手續費估計
         log_event(LOG_FILE, strategy="dip", timeframe=TREND_TF, action="exit", side="sell",
                   price=round(px, 2), qty=self.dip["qty"], reason="time", pnl=round(pnl, 2), dry=DRY_RUN)
         self.dip = None
@@ -827,37 +830,48 @@ class MixedLiveTrader:
         self.save_state()
         return True
 
-    def _manage_harm_pending(self, df):
+    def _manage_harm_pending(self, bar):
+        """掛單生命週期一律以「已收完 K 線」判定（dry 成交／X 失效／逾時）。
+
+        舊版讀 df.iloc[-1]＝形成中 K 線：on_1h 觸發當下它只有幾秒資料，剛收完
+        那一小時的行情從未被檢查——dry 成交偵測系統性漏抓、X 失效判定 repaint。
+        """
         pos_size = self._exch_pos_size()
         if pos_size is None:
             print("⚠️ 無法確認諧波掛單是否成交，保留掛單狀態。")
             return
-        if pos_size != 0 or (DRY_RUN and self._dry_harm_filled(df)):
+        if pos_size != 0 or (DRY_RUN and self._dry_harm_filled(bar)):
             print("✅ [諧波] 限價單成交 → 持倉（SL/TP 由交易所端執行）")
+            if DRY_RUN:
+                self.harm["fill_time"] = str(bar.name)  # dry SL/TP 掃描起點（含成交根）
             log_event(LOG_FILE, strategy="harmonic", timeframe=HARM_TF, action="fill",
                       side="buy" if self.harm["bull"] else "sell", pattern=self.harm["pattern"],
                       price=self.harm["entry"], qty=self.harm["qty"], sl=round(self.harm["sl"], 2),
                       tp=round(self.harm["tp"], 2), dry=DRY_RUN)
             self.active = "harm_pos"; self.save_state(); return
-        close = float(df["close"].iloc[-1]); bull = self.harm["bull"]
+        close = float(bar["close"]); bull = self.harm["bull"]
         if (bull and close < self.harm["x_price"]) or (not bull and close > self.harm["x_price"]):
             self._cancel_harm("價格突破 X，型態失效")
         elif self.harm.get("placed") and (
-            df.index[-1] - pd.Timestamp(self.harm["placed"])
+            bar.name - pd.Timestamp(self.harm["placed"])
         ) > timeframe_to_timedelta(HARM_TF) * HARM_WAIT:
             self._cancel_harm(f"超過 {HARM_WAIT} 根未成交")
 
-    def _dry_harm_filled(self, df):
-        """DRY-RUN 模擬：最新 1h K 線是否觸及限價。"""
-        bull = self.harm["bull"]; hi, lo = float(df["high"].iloc[-1]), float(df["low"].iloc[-1])
-        return (lo <= self.harm["entry"]) if bull else (hi >= self.harm["entry"])
+    def _dry_harm_filled(self, bar):
+        """DRY-RUN 模擬：剛收完的 1h K 線是否觸及限價。"""
+        bull = self.harm["bull"]
+        return (float(bar["low"]) <= self.harm["entry"]) if bull else (float(bar["high"]) >= self.harm["entry"])
 
-    def _monitor_harm(self, df):
+    def _monitor_harm(self, bar, df):
         if not DRY_RUN:
             pos_size = self._exch_pos_size()
             if pos_size is None:
                 print("⚠️ 無法確認諧波持倉狀態，保留本地狀態。")
                 return
+            if pos_size != 0:
+                # 部分成交後殘餘限價單可能在盤中補成交，持倉量增加；每次監控刷新
+                # qty，讓平倉記錄的 PnL 對得上實際部位（平倉本身讀交易所 size 不受影響）
+                self.harm["qty"] = abs(pos_size)
             if pos_size == 0:   # 實單：交易所端 SL/TP 已平倉
                 print("✅ [諧波] 持倉已由交易所 SL/TP 平倉 → 回到等待")
                 log_event(LOG_FILE, strategy="harmonic", timeframe=HARM_TF, action="exit",
@@ -865,15 +879,28 @@ class MixedLiveTrader:
                           reason="exchange_sl_tp", dry=False)
                 self.harm = None; self.active = "none"; self.save_state()
             return
-        # DRY-RUN：用最新 K 線模擬交易所端 SL/TP 觸發（否則持倉會卡住不出場）
-        hi, lo, bull = float(df["high"].iloc[-1]), float(df["low"].iloc[-1]), self.harm["bull"]
-        if bull:
-            hit = "SL" if lo <= self.harm["sl"] else ("TP" if hi >= self.harm["tp"] else None)
-        else:
-            hit = "SL" if hi >= self.harm["sl"] else ("TP" if lo <= self.harm["tp"] else None)
+        # DRY-RUN：掃描「成交後 → 最新已收完 K 線」整段區間模擬交易所端 SL/TP。
+        # 只看單一 bar 有兩個洞：(1) 形成中 K 線僅幾秒資料，剛收完那小時從未被檢查；
+        # (2) 重啟離線期間 SL 被掃過且價格未再回來 → SL 是方向性水位，單根檢查會讓
+        # 倉位永久卡死（議會 2026-07-05，DeepSeek 指出）。成交根只判 SL 不判 TP
+        # （高/低點可能發生在成交前），與回測 simulate_trade 同一套語意。
+        bull = self.harm["bull"]
+        start = self.harm.get("fill_time") or self.harm.get("placed")
+        window = df[df.index <= bar.name]
+        window = window[window.index >= pd.Timestamp(start)] if start else window.tail(1)
+        hit = None
+        first = bool(self.harm.get("fill_time"))  # 有記錄成交根才知道首根是成交根
+        for _, b in window.iterrows():
+            hi, lo = float(b["high"]), float(b["low"])
+            if (lo <= self.harm["sl"]) if bull else (hi >= self.harm["sl"]):
+                hit = "SL"; break
+            if not first and ((hi >= self.harm["tp"]) if bull else (lo <= self.harm["tp"])):
+                hit = "TP"; break
+            first = False
         if hit:
             px = self.harm["sl"] if hit == "SL" else self.harm["tp"]
             pnl = ((px - self.harm["entry"]) if bull else (self.harm["entry"] - px)) * self.harm["qty"]
+            pnl -= self.harm["qty"] * (self.harm["entry"] + px) * FEE  # 手續費估計（taker 雙邊）
             print(f"✅ [諧波] (DRY) {hit} 觸及 @ {px:.2f} → 平倉")
             log_event(LOG_FILE, strategy="harmonic", timeframe=HARM_TF, action="exit",
                       side="sell" if bull else "buy", pattern=self.harm["pattern"], price=round(px, 2),
@@ -912,9 +939,9 @@ class MixedLiveTrader:
         if self.active in ("trend", "dip_pos"):
             return  # 趨勢/抄底持倉中，諧波讓步（互斥）
         if self.active == "harm_pending":
-            self._manage_harm_pending(df)
+            self._manage_harm_pending(bar)
         elif self.active == "harm_pos":
-            self._monitor_harm(df)
+            self._monitor_harm(bar, df)
         elif self.active == "none":
             # 只有 _detect_harm 吃「已收完 K 線」切片：形成中 K 線的 close/high/low 會持續變動，
             # 拿來當樞軸確認 bar 或趨勢過濾（close vs ema200）會 repaint、且與回測

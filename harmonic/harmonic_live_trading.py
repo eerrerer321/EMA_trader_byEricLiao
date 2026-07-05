@@ -366,7 +366,10 @@ class HarmonicTrader:
             self._check_pending(df)
             return
         # 3) 空閒：偵測新型態 → 掛限價單
-        sig = self._detect_signal(df)
+        # 偵測只吃「已收完 K 線」切片（對齊 run_mixed_live 的 FIX-G）：形成中 K 線的
+        # close/high/low 持續變動，會造成樞軸 repaint 與順大勢過濾抖動；掛單管理
+        # (_check_pending) 維持吃完整 df，刻意保留盤中敏感度。
+        sig = self._detect_signal(df[df.index <= bar.name])
         if not sig or sig["c_time"] == self.last_signal_key:
             return
         # 只有真的掛出單才消耗 dedup key，否則訊號會被無聲吞掉

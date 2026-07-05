@@ -138,9 +138,19 @@ def detect_opportunities(df: pd.DataFrame, trend_filter: bool = True, pivot_n: i
 
 
 def simulate_trade(op, h, l, c, n):
-    """模擬單一諧波單的出場 (單一 TP 全倉，初始停損保守先判)。回傳 (exit_pos, fill, reason)。"""
+    """模擬單一諧波單的出場 (單一 TP 全倉，SL 保守先判)。回傳 (exit_pos, fill, reason)。
+
+    進場那根 K 線也必須判 SL：多方單價格要到達 SL（PRZ 遠緣下方）必先穿過
+    PRZ 上緣＝限價成交點，且交易所端 SL 於成交後即啟動——故 l[j] <= sl 代表
+    「先成交、後掃損」順序上必然成立，不是保守假設（實測不判會高估 PF：
+    ETH 4h 2.13→1.38、1h 1.18→1.09）。TP 不在進場根判定：高點可能發生在
+    成交之前，順序無法確認，計入會反向樂觀。
+    """
     bull, sl, tp = op["bull"], op["sl"], op["tp"]
-    for mm in range(op["j"] + 1, n):
+    j = op["j"]
+    if (bull and l[j] <= sl) or (not bull and h[j] >= sl):
+        return j, sl, "SL"
+    for mm in range(j + 1, n):
         if bull:
             if l[mm] <= sl:
                 return mm, sl, "SL"

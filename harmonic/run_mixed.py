@@ -96,6 +96,14 @@ def mixed_backtest(df, opps, initial=1000.0, params=None,
                     equity -= qty * entry * FEE
                     hp = {"entry": entry, "sl": op["sl"], "tp": op["tp"], "bull": op["bull"], "qty": qty}
                     ptype = "harm"; pos = "H"
+                    # 諧波進場那根同樣判 SL（對稱於下方趨勢腿「含進場那根」；
+                    # 成交必先於 SL 掃穿，見 harmonic_strategy.simulate_trade 說明）
+                    if (hp["bull"] and float(bar["low"]) <= hp["sl"]) or \
+                            ((not hp["bull"]) and float(bar["high"]) >= hp["sl"]):
+                        fill = hp["sl"] * (1 - SLIP) if hp["bull"] else hp["sl"] * (1 + SLIP)
+                        gross = (fill - hp["entry"]) * hp["qty"] if hp["bull"] else (hp["entry"] - fill) * hp["qty"]
+                        equity += gross - hp["qty"] * fill * FEE
+                        hp = pos = ptype = None
         # 3) 趨勢同根停損檢查（含進場那根）
         if ptype == "trend":
             st = check_stop_exit(pos, bar, params)
